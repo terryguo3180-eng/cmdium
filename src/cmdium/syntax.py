@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Callable
 from dataclasses import dataclass
 from enum import auto
 
@@ -12,6 +12,7 @@ from cmdium.utils import DataEnum
 class TokenKind(DataEnum):
   INT = auto()
   NAME = auto()
+  KW = auto()
   OP = auto()
   EOF = auto()
 
@@ -23,11 +24,15 @@ class Token:
   pos: int
 
 
+keywords = {
+  "type", "struct",
+}
+
 tokens_pat = re.compile(r"""
     (?P<_>    \s+)
   | (?P<INT>  \d+)
   | (?P<NAME> \w+)
-  | (?P<OP>   \+ | - | \* | / | % | = | : | ; | \( | \) )
+  | (?P<OP>   \+ | - | \* | / | % | = | : | ; | , | \( | \) | \{ | \} )
 """, re.X)
 
 
@@ -52,6 +57,11 @@ def lex(src: str):
       "NAME": TokenKind.NAME,
       "OP": TokenKind.OP,
     }[kind_str]
+
+    text = match.group()
+
+    if kind == TokenKind.NAME and text in keywords:
+      kind = TokenKind.KW
 
     yield Token(kind, match.group(), pos)
 
@@ -79,16 +89,24 @@ class VarDecl(Statement):
 
 
 @dataclass
+class TypeDecl(Statement):
+  name: str
+  type: Type
+
+
+@dataclass
+class StructDecl(Statement):
+  name: str
+  fields: list[StructField]
+
+
+@dataclass
 class Assign(Statement):
-  dst: LeftValue
+  dst: Expression
   val: Expression
 
 
 class Expression(AST):
-  ...
-
-
-class LeftValue(Expression):
   ...
 
 
@@ -108,8 +126,14 @@ class BinaryExpr(Expression):
 
 
 @dataclass
-class Name(LeftValue):
+class Name(Expression):
   name: str
+
+
+@dataclass
+class MemberAccess(Expression):
+  src: Expression
+  att: str
 
 
 @dataclass
@@ -125,6 +149,11 @@ class Type(AST):
 class NamedType(Type):
   name: str
 
+
+@dataclass
+class StructField(AST):
+  name: str
+  type: Type
 
 
 class Parser:
@@ -150,7 +179,19 @@ class Parser:
         self.pos += 1
       return tok
     return None
-  
+
+  def expect(
+    self, msg: str, kind: TokenKind, text: str | None = None
+  ) -> Token:
+    if not (tok := self.accept(kind, text)):
+      raise SyntaxError(f"{self.current_tok()!r}: expected {msg}")
+    return tok
+
+  def expect_rule[T: AST](self, msg: str, rule: Callable[[], T | None]) -> T:
+    if not (tree := rule()):
+      raise SyntaxError(f"{self.current_tok()!r}: expected {msg}")
+    return tree
+
   def parse(self) -> CompilationUnit:
     # program : stmt* &&EOF
     body: list[Statement] = []
@@ -164,40 +205,67 @@ class Parser:
     raise SyntaxError(f"{self.current_tok()!r}: expected EOF")
 
   def parse_stmt(self) -> Statement | None:
-    # stmt : vardecl
+    # stmt : var_decl
+    #      | type_decl
     #      | assign
-    if decl := self.parse_vardecl():
+
+    if decl := self.parse_var_decl():
       return decl
+
+    if type_decl := self.parse_type_decl():
+      return type_decl
 
     if assign := self.parse_assign():
       return assign
 
     return None
 
-  def parse_vardecl(self) -> VarDecl | None:
-    # vardecl : NAME ":" type ("=" &&expr)? &&";"
+  def parse_var_decl(self) -> VarDecl | None:
+    # var_decl : NAME ":" ~ type ("=" expr)? ";"
     mark = self.tell()
 
     if (
       (name := self.accept(TokenKind.NAME))
       and self.accept(TokenKind.OP, ":")
-      and (type := self.parse_type())
     ):
+      type = self.expect_rule("type expression", self.parse_type)
+        
       if self.accept(TokenKind.OP, "="):
-        init = self.parse_expr()
-        if init is None:
-          raise SyntaxError(
-            f"{self.current_tok()!r}: expected expr"
-          )
+        init = self.expect_rule("expression", self.parse_expr)
+        sm_msg = "expr or ';'"
       else:
         init = None
+        sm_msg = "';'"
 
-      if not self.accept(TokenKind.OP, ";"):
-        raise SyntaxError(
-          f"{self.current_tok()!r}: expected ';'"
-        )
-
+      self.expect(sm_msg, TokenKind.OP, ";")
       return VarDecl(name.text, type, init)
+
+    self.seek(mark)
+    return None
+
+  def parse_type_decl(self) -> TypeDecl | StructDecl | None:
+    # type_decl : "type" ~ NAME "=" type ";"
+    #           | "struct" ~ NAME "{" struct_fields? &&"}" ";"
+  
+    mark = self.tell()
+    if self.accept(TokenKind.KW, "type"):
+      name = self.expect("name", TokenKind.NAME)
+      self.expect("'='", TokenKind.OP, "=")
+      type = self.expect_rule("type expression", self.parse_type)
+      self.expect("';'", TokenKind.OP, ";")
+      return TypeDecl(name.text, type)
+
+    self.seek(mark)
+    if self.accept(TokenKind.KW, "struct"):
+      name = self.expect("name", TokenKind.NAME)
+      self.expect("'{'", TokenKind.OP, "{")
+
+      fields = self.parse_struct_fields()
+      cb_msg = "'}'" if fields else "struct fields or '}'"
+
+      self.expect(cb_msg, TokenKind.OP, "}")
+      self.expect("';'", TokenKind.OP, ";")
+      return StructDecl(name.text, fields)
 
     self.seek(mark)
     return None
@@ -209,12 +277,37 @@ class Parser:
 
     return None
 
-  def parse_assign(self) -> Assign | None:
-    # assign : lval "=" expr ";"
+  def parse_struct_fields(self) -> list[StructField]:
+    # struct_fields : struct_field "," struct_fields
+    #               | struct_field ","?
+    fields = []
+    while f := self.parse_struct_field():
+      fields.append(f)
+      if not self.accept(TokenKind.OP, ","):
+        break
+    
+    return fields
+
+  def parse_struct_field(self) -> StructField | None:
+    # struct_field : NAME ":" ~ type
     mark = self.tell()
 
     if (
-      (dst := self.parse_lval())
+      (name := self.accept(TokenKind.NAME))
+      and self.accept(TokenKind.OP, ":")
+    ):
+      type = self.expect_rule("type expression", self.parse_type)
+      return StructField(name.text, type)
+
+    self.seek(mark)
+    return None
+
+  def parse_assign(self) -> Assign | None:
+    # assign : expr "=" expr ";"
+    mark = self.tell()
+
+    if (
+      (dst := self.parse_expr())
       and self.accept(TokenKind.OP, "=")
       and (val := self.parse_expr())
       and self.accept(TokenKind.OP, ";")
@@ -222,13 +315,6 @@ class Parser:
       return Assign(dst, val)
 
     self.seek(mark)
-    return None
-
-  def parse_lval(self) -> LeftValue | None:
-    # lval : NAME
-    if name := self.accept(TokenKind.NAME):
-      return Name(name.text)
-
     return None
 
   def parse_expr(self) -> Expression | None:
@@ -249,20 +335,16 @@ class Parser:
       else:
         break
 
-      if rhs := self.parse_term():
-        lhs = BinaryExpr(lhs, op, rhs)
-      else:
-        raise SyntaxError(
-          f"{self.current_tok()!r}: expected term"
-        )
+      rhs = self.expect_rule("term expression", self.parse_term)
+      lhs = BinaryExpr(lhs, op, rhs)
 
     return lhs
 
   def parse_term(self) -> Expression | None:
-    # term : atom (("*" | "/" | "%") &&atom)*
+    # term : primary (("*" | "/" | "%") &&primary)*
     mark = self.tell()
 
-    if not (lhs := self.parse_atom()):
+    if not (lhs := self.parse_primary()):
       self.seek(mark)
       return None
 
@@ -278,14 +360,22 @@ class Parser:
       else:
         break
 
-      if rhs := self.parse_atom():
-        lhs = BinaryExpr(lhs, op, rhs)
-      else:
-        raise SyntaxError(
-          f"{self.current_tok()!r}: expected atom"
-        )
+      rhs = self.expect_rule("primary expression", self.parse_term)
+      lhs = BinaryExpr(lhs, op, rhs)
 
     return lhs
+
+  def parse_primary(self) -> Expression | None:
+    # primary : atom ("." &&NAME)*
+
+    if not (val := self.parse_atom()):
+      return None
+    
+    while self.accept(TokenKind.OP, "."):
+      att = self.expect("field name", TokenKind.NAME)
+      val = MemberAccess(val, att.text)
+
+    return val
 
   def parse_atom(self) -> Expression | None:
     # atom : NAME
@@ -314,10 +404,6 @@ def parse(src: str) -> CompilationUnit:
   lexer = lex(src)
   parser = Parser(lexer)
   tree = parser.parse()
-
-  if tree is None:
-    raise SyntaxError("invalid program")
-
   return tree
 
 
