@@ -4,12 +4,9 @@ import re
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import auto
 
-
-class DataEnum(Enum):
-  def __repr__(self):
-    return f"{type(self).__name__}.{self.name}"
+from cmdium.utils import DataEnum
 
 
 class TokenKind(DataEnum):
@@ -61,7 +58,6 @@ def lex(src: str):
   yield Token(TokenKind.EOF, "", pos)
 
 
-@dataclass
 class AST:
   ...
 
@@ -71,7 +67,6 @@ class CompilationUnit(AST):
   body: list[Statement]
 
 
-@dataclass
 class Statement:
   ...
 
@@ -89,12 +84,10 @@ class Assign(Statement):
   val: Expression
 
 
-@dataclass
 class Expression(AST):
   ...
 
 
-@dataclass
 class LeftValue(Expression):
   ...
 
@@ -124,7 +117,6 @@ class ScalarLiteral(Expression):
   text: str
 
 
-@dataclass
 class Type(AST):
   ...
 
