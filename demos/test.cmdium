@@ -3,6 +3,16 @@ c: i32 = 5;
 b: i32 = 7;
 d: i32 = a + b * c / (a - b) % 3;
 
-struct Point { x: i32, y: i32 };
+struct X {
+  a: i32,
+  b: i32,
+};
+
+struct Point {
+  x: i32,
+  y: i32,
+  c: X
+};
 p: Point;
 q: Point = p;
+k: X;

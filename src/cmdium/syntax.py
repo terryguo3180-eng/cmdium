@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 
 from collections.abc import Iterable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import auto
 
 from cmdium.utils import DataEnum
+from cmdium import semantic
 
 
 class TokenKind(DataEnum):
@@ -32,7 +33,7 @@ tokens_pat = re.compile(r"""
     (?P<_>    \s+)
   | (?P<INT>  \d+)
   | (?P<NAME> \w+)
-  | (?P<OP>   \+ | - | \* | / | % | = | : | ; | , | \( | \) | \{ | \} )
+  | (?P<OP>   \+ | - | \* | / | % | = | : | ; | \. | , | \( | \) | \{ | \} )
 """, re.X)
 
 
@@ -84,14 +85,19 @@ class Statement:
 @dataclass
 class VarDecl(Statement):
   name: str
-  type: Type
+  type: TypeExpr
   init: Expression | None
+
+  sym: semantic.Symbol = field(init=False)
+
+  def set_symbol(self, sym: semantic.Symbol):
+    self.sym = sym
 
 
 @dataclass
 class TypeDecl(Statement):
   name: str
-  type: Type
+  type: TypeExpr
 
 
 @dataclass
@@ -107,7 +113,12 @@ class Assign(Statement):
 
 
 class Expression(AST):
-  ...
+  type: semantic.TypeInfo
+  lval: bool
+
+  def set_typeinfo(self, type: semantic.TypeInfo, lval: bool):
+    self.type = type
+    self.lval = lval
 
 
 class BinaryOp(DataEnum):
@@ -129,6 +140,11 @@ class BinaryExpr(Expression):
 class Name(Expression):
   name: str
 
+  sym: semantic.Symbol = field(init=False)
+
+  def set_symbol(self, sym: semantic.Symbol):
+    self.sym = sym
+
 
 @dataclass
 class MemberAccess(Expression):
@@ -141,19 +157,19 @@ class ScalarLiteral(Expression):
   text: str
 
 
-class Type(AST):
+class TypeExpr(AST):
   ...
 
 
 @dataclass
-class NamedType(Type):
+class NamedType(TypeExpr):
   name: str
 
 
 @dataclass
 class StructField(AST):
   name: str
-  type: Type
+  type: TypeExpr
 
 
 class Parser:
@@ -270,7 +286,7 @@ class Parser:
     self.seek(mark)
     return None
 
-  def parse_type(self) -> Type | None:
+  def parse_type(self) -> TypeExpr | None:
     # type : NAME
     if name := self.accept(TokenKind.NAME):
       return NamedType(name.text)
