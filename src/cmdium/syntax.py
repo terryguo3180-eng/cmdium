@@ -30,7 +30,7 @@ tokens_pat = re.compile(r"""
     (?P<_>    \s+)
   | (?P<INT>  \d+)
   | (?P<NAME> \w+)
-  | (?P<OP>   \+ | - | \* | / | = | ; | \( | \))
+  | (?P<OP>   \+ | - | \* | / | % | = | : | ; | \( | \) )
 """, re.X)
 
 
@@ -77,8 +77,15 @@ class Statement:
 
 
 @dataclass
+class VarDecl(Statement):
+  name: str
+  type: Type
+  init: Expression | None
+
+
+@dataclass
 class Assign(Statement):
-  dst: str
+  dst: LeftValue
   val: Expression
 
 
@@ -87,11 +94,17 @@ class Expression(AST):
   ...
 
 
+@dataclass
+class LeftValue(Expression):
+  ...
+
+
 class BinaryOp(DataEnum):
   ADD = auto()
   SUB = auto()
   MUL = auto()
   DIV = auto()
+  MOD = auto()
 
 
 @dataclass
@@ -102,13 +115,24 @@ class BinaryExpr(Expression):
 
 
 @dataclass
-class Name(Expression):
+class Name(LeftValue):
   name: str
 
 
 @dataclass
 class ScalarLiteral(Expression):
   text: str
+
+
+@dataclass
+class Type(AST):
+  ...
+
+
+@dataclass
+class NamedType(Type):
+  name: str
+
 
 
 class Parser:
@@ -122,6 +146,9 @@ class Parser:
   def seek(self, i: int):
     self.pos = i
 
+  def current_tok(self):
+    return self.toks[self.pos]
+
   def accept(
     self, kind: TokenKind, text: str | None = None
   ) -> Token | None:
@@ -132,37 +159,88 @@ class Parser:
       return tok
     return None
   
-  def parse(self) -> CompilationUnit | None:
-    # program := assign* EOF
-    mark = self.tell()
+  def parse(self) -> CompilationUnit:
+    # program : stmt* &&EOF
     body: list[Statement] = []
 
-    while assign := self.parse_assign():
-      body.append(assign)
+    while stmt := self.parse_stmt():
+      body.append(stmt)
 
     if self.accept(TokenKind.EOF):
       return CompilationUnit(body)
 
-    self.seek(mark)
+    raise SyntaxError(f"{self.current_tok()!r}: expected EOF")
+
+  def parse_stmt(self) -> Statement | None:
+    # stmt : vardecl
+    #      | assign
+    if decl := self.parse_vardecl():
+      return decl
+
+    if assign := self.parse_assign():
+      return assign
+
     return None
 
-  def parse_assign(self) -> Assign | None:
-    # assign := NAME "=" expr ";"
+  def parse_vardecl(self) -> VarDecl | None:
+    # vardecl : NAME ":" type ("=" &&expr)? &&";"
     mark = self.tell()
 
     if (
-      (target := self.accept(TokenKind.NAME))
-      and self.accept(TokenKind.OP, "=")
-      and (expr := self.parse_expr())
-      and self.accept(TokenKind.OP, ";")
+      (name := self.accept(TokenKind.NAME))
+      and self.accept(TokenKind.OP, ":")
+      and (type := self.parse_type())
     ):
-      return Assign(target.text, expr)
+      if self.accept(TokenKind.OP, "="):
+        init = self.parse_expr()
+        if init is None:
+          raise SyntaxError(
+            f"{self.current_tok()!r}: expected expr"
+          )
+      else:
+        init = None
+
+      if not self.accept(TokenKind.OP, ";"):
+        raise SyntaxError(
+          f"{self.current_tok()!r}: expected ';'"
+        )
+
+      return VarDecl(name.text, type, init)
 
     self.seek(mark)
     return None
 
+  def parse_type(self) -> Type | None:
+    # type : NAME
+    if name := self.accept(TokenKind.NAME):
+      return NamedType(name.text)
+
+    return None
+
+  def parse_assign(self) -> Assign | None:
+    # assign : lval "=" expr ";"
+    mark = self.tell()
+
+    if (
+      (dst := self.parse_lval())
+      and self.accept(TokenKind.OP, "=")
+      and (val := self.parse_expr())
+      and self.accept(TokenKind.OP, ";")
+    ):
+      return Assign(dst, val)
+
+    self.seek(mark)
+    return None
+
+  def parse_lval(self) -> LeftValue | None:
+    # lval : NAME
+    if name := self.accept(TokenKind.NAME):
+      return Name(name.text)
+
+    return None
+
   def parse_expr(self) -> Expression | None:
-    # expr := term (("+" | "-") term)*
+    # expr : term (("+" | "-") &&term)*
     mark = self.tell()
 
     if not (lhs := self.parse_term()):
@@ -182,13 +260,14 @@ class Parser:
       if rhs := self.parse_term():
         lhs = BinaryExpr(lhs, op, rhs)
       else:
-        self.seek(mark)
-        break
+        raise SyntaxError(
+          f"{self.current_tok()!r}: expected term"
+        )
 
     return lhs
 
   def parse_term(self) -> Expression | None:
-    # term := atom (("*" | "/") atom)*
+    # term : atom (("*" | "/" | "%") &&atom)*
     mark = self.tell()
 
     if not (lhs := self.parse_atom()):
@@ -202,21 +281,24 @@ class Parser:
         op = BinaryOp.MUL
       elif self.accept(TokenKind.OP, "/"):
         op = BinaryOp.DIV
+      elif self.accept(TokenKind.OP, "%"):
+        op = BinaryOp.MOD
       else:
         break
 
       if rhs := self.parse_atom():
         lhs = BinaryExpr(lhs, op, rhs)
       else:
-        self.seek(mark)
-        break
+        raise SyntaxError(
+          f"{self.current_tok()!r}: expected atom"
+        )
 
     return lhs
 
   def parse_atom(self) -> Expression | None:
-    # atom := NAME
-    #       | INT
-    #       | "(" expr ")"
+    # atom : NAME
+    #      | INT
+    #      | "(" expr ")"
 
     if name := self.accept(TokenKind.NAME):
       return Name(name.text)

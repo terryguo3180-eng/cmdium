@@ -47,7 +47,7 @@ class IRBuilder:
   def __init__(self):
     self.insts: list[IR] = []
     self.n_tmp = -1
-    self.names: dict[str, Operand] = {}
+    self.names: dict[str, Place] = {}
 
   def emit(self, inst: IR):
     self.insts.append(inst)
@@ -56,10 +56,12 @@ class IRBuilder:
     self.n_tmp += 1
     return ScoreSlot(f"#t{self.n_tmp}")
 
-  def add_name(self, name: str):
-    self.names[name] = ScoreSlot(name)
+  def add_name(self, name: str) -> ScoreSlot:
+    slot = ScoreSlot(name)
+    self.names[name] = slot
+    return slot
 
-  def get_name(self, name: str) -> Operand | None:
+  def get_name(self, name: str) -> Place | None:
     return self.names.get(name)
 
 
@@ -76,9 +78,20 @@ class Lowerer:
 
   def visit_stmt(self, node: syntax.Statement):
     match node:
+      case syntax.VarDecl():
+        if node.init is not None:
+          init = self.visit_expr(node.init)
+        else:
+          init = None
+        
+        name = node.name
+        slot = self.builder.add_name(name)
+
+        if init is not None:
+          self.builder.emit(Copy(slot, init))
+
       case syntax.Assign():
-        dst = ScoreSlot(node.dst)
-        self.builder.add_name(node.dst)
+        dst = self.visit_lval(node.dst)
         val = self.visit_expr(node.val)
         self.builder.emit(Copy(dst, val))
 
@@ -91,10 +104,7 @@ class Lowerer:
         return dst
 
       case syntax.Name():
-        if not (val := self.builder.get_name(node.name)):
-          raise SyntaxError(f"unknown name: {node.name!r}")
-
-        return val
+        return self.visit_lval(node)
 
       case syntax.ScalarLiteral():
         val = int(node.text)
@@ -102,6 +112,17 @@ class Lowerer:
           raise SyntaxError(f"invalid integer size: {val}")
 
         return ImmValue(val)
+
+      case _:
+        assert False
+
+  def visit_lval(self, node: syntax.LeftValue) -> Place:
+    match node:
+      case syntax.Name():
+        if not (val := self.builder.get_name(node.name)):
+          raise SyntaxError(f"unknown name: {node.name!r}")
+
+        return val
 
       case _:
         assert False
@@ -168,7 +189,7 @@ class DatapackRenderer:
 
       case ScoreSlot(), syntax.BinaryOp.SUB, ImmValue():
         self.emit(
-          f"scoreborad players remove {dst.holder} {self.ns} {src.val}",
+          f"scoreboard players remove {dst.holder} {self.ns} {src.val}",
           func="main"
         )
 
@@ -178,6 +199,7 @@ class DatapackRenderer:
           syntax.BinaryOp.SUB: "-=",
           syntax.BinaryOp.MUL: "*=",
           syntax.BinaryOp.DIV: "/=",
+          syntax.BinaryOp.MOD: "%=",
         }[bop]
 
         if isinstance(src, ImmValue):
