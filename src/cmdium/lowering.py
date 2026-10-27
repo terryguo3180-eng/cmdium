@@ -33,7 +33,7 @@ class Place(Operand):
 
   def leaves(self) -> Iterator[Place]:
     match self.type:
-      case semantic.TypeInfo(fields=fields):
+      case semantic.Struct(fields=fields):
         for f in fields:
           yield from self.project(f).leaves()
       
@@ -109,7 +109,7 @@ class Lowering:
         assert isinstance(dst, Place)
         self.builder.emit(Copy(dst, val))
 
-      case syntax.StructDecl():
+      case syntax.TypeDecl() | syntax.StructDecl():
         pass
 
       case _:
@@ -123,7 +123,7 @@ class Lowering:
         self.builder.emit(Copy(dst, lhs))
 
         rhs = self.lower_expr(node.rhs)
-        self.builder.emit(BinOp(dst, node.bop, rhs))
+        self.builder.emit(BinOp(dst, node.bop.bop, rhs))
 
         return dst
 
@@ -137,9 +137,6 @@ class Lowering:
 
       case syntax.ScalarLiteral():
         val = int(node.text)
-        if not -2147483648 <= val <= 2147483647:
-          raise SyntaxError(f"invalid integer size: {val}")
-
         imm = ImmValue(val, node.type)
         return imm
 

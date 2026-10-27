@@ -1,21 +1,30 @@
 from cmdium import syntax
+from cmdium.error import CompileError, format_error
 from cmdium.semantic import Semantic
 from cmdium.lowering import Lowering
 from cmdium.codegen import DatapackGen
 
 
-with open("../demos/test.cmdium") as f:
+file = "../demos/test.cmdium"
+
+with open(file, encoding="utf-8") as f:
   src = f.read()
 
-tree = syntax.parse(src)
-typed = Semantic(tree).analyze()
-insts = Lowering(tree).lower()
-funcs = DatapackGen(insts, "cmdium").render()
+try:
+  tree = syntax.parse(src, file)
+  typed = Semantic(tree, file).analyze()
 
-for func, cmds in funcs.items():
-  print("# " + func + ".mcfunction")
+except CompileError as err:
+  print(format_error(err, True))
 
-  for cmd in cmds:
-    print("  " + cmd)
+else:
+  insts = Lowering(tree).lower()
+  funcs = DatapackGen(insts, "cmdium").render()
 
-  print()
+  for func, cmds in funcs.items():
+    print("# " + func + ".mcfunction")
+
+    for cmd in cmds:
+      print("  " + cmd)
+
+    print()
