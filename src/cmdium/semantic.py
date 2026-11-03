@@ -54,38 +54,38 @@ class Symbol:
   type: TypeInfo
 
 
-class BuiltinTypes:
-  i32 = Prim(PrimKind.I32)
-  bool = Prim(PrimKind.BOOL)
-  void = Prim(PrimKind.VOID)
-
 
 def binop_type(
   op: syntax.BinaryOpNode, lhs: TypeInfo, rhs: TypeInfo
 ) -> TypeInfo:
-  match op.bop:
+  match op.bop, lhs, rhs:
     case (
       syntax.BinaryOp.ADD | syntax.BinaryOp.SUB |
       syntax.BinaryOp.MUL | syntax.BinaryOp.DIV |
       syntax.BinaryOp.MOD
-    ) if lhs == rhs == BuiltinTypes.i32:
-      return BuiltinTypes.i32
+    ), Prim(PrimKind.I32), Prim(PrimKind.I32):
+      return Prim(PrimKind.I32)
 
     case (
       syntax.BinaryOp.CGT | syntax.BinaryOp.CLT |
       syntax.BinaryOp.CGE | syntax.BinaryOp.CLE
-    ) if lhs == rhs == BuiltinTypes.i32:
-      return BuiltinTypes.bool
+    ), Prim(PrimKind.I32), Prim(PrimKind.I32):
+      return Prim(PrimKind.BOOL)
 
     case (
       syntax.BinaryOp.CEQ | syntax.BinaryOp.CNE
-    ) if lhs == rhs in (BuiltinTypes.i32, BuiltinTypes.bool):
-      return BuiltinTypes.bool
+    ), Prim(PrimKind.I32), Prim(PrimKind.I32):
+      return Prim(PrimKind.BOOL)
+
+    case (
+      syntax.BinaryOp.CEQ | syntax.BinaryOp.CNE
+    ), Prim(PrimKind.BOOL), Prim(PrimKind.BOOL):
+      return Prim(PrimKind.BOOL)
 
     case (
       syntax.BinaryOp.OR | syntax.BinaryOp.AND
-    ) if lhs == rhs == BuiltinTypes.bool:
-      return BuiltinTypes.bool
+    ), Prim(PrimKind.BOOL), Prim(PrimKind.BOOL):
+      return Prim(PrimKind.BOOL)
 
     case _:
       raise error.CompileError(
@@ -94,12 +94,12 @@ def binop_type(
 
 
 def unaop_type(op: syntax.UnaryOpNode, val: TypeInfo) -> TypeInfo:
-  match op.uop:
-    case syntax.UnaryOp.NEG if val == BuiltinTypes.i32:
-      return BuiltinTypes.i32
+  match op.uop, val:
+    case syntax.UnaryOp.NEG, Prim(PrimKind.I32):
+      return Prim(PrimKind.I32)
 
-    case syntax.UnaryOp.NOT if val == BuiltinTypes.bool:
-      return BuiltinTypes.bool
+    case syntax.UnaryOp.NOT, Prim(PrimKind.BOOL):
+      return Prim(PrimKind.BOOL)
 
     case _:
       raise error.CompileError(
@@ -146,9 +146,9 @@ def root_scope(file: str) -> Scope:
   scope = Scope()
   span = error.Span(file, 0, 0)
 
-  for att, type in vars(BuiltinTypes).items():
-    if isinstance(type, TypeInfo):
-      scope.declare_type(att, type, span)
+  scope.declare_type("i32", Prim(PrimKind.I32), span)
+  scope.declare_type("bool", Prim(PrimKind.BOOL), span)
+  scope.declare_type("void", Prim(PrimKind.VOID), span)
   
   return scope
 
@@ -272,7 +272,7 @@ class Semantic:
         name_tok=name_tok,
       ):
         if ret_type is None:
-          return_type = BuiltinTypes.void
+          return_type = Prim(PrimKind.VOID)
         else:
           return_type = self.analyze_type(ret_type)
 
@@ -300,7 +300,7 @@ class Semantic:
 
       case syntax.If(test=test, body=body, orelse=orelse):
         self.analyze_expr(test)
-        if test.type != BuiltinTypes.bool:
+        if test.type != Prim(PrimKind.BOOL):
           raise error.CompileError(
             f"invalid type for if condition: {test.type!s} (must be bool)",
             test.span
@@ -318,7 +318,7 @@ class Semantic:
           raise error.CompileError("return statement outside function", span)
 
         if val is None:
-          val_ty = BuiltinTypes.void
+          val_ty = Prim(PrimKind.VOID)
           val_span = node.span
         else:
           self.analyze_expr(val)
@@ -334,7 +334,7 @@ class Semantic:
       case syntax.While(test=test, body=body):
         if test is not None:
           self.analyze_expr(test)
-          if test.type != BuiltinTypes.bool:
+          if test.type != Prim(PrimKind.BOOL):
             raise error.CompileError(
               f"invalid type for while condition: {test.type!s} (must be bool)",
               test.span
@@ -395,12 +395,17 @@ class Semantic:
 
         node.set_typeinfo(src.type.ret_type, False)
 
-      case syntax.ScalarLiteral(text=text, span=span):
-        val = int(text)
-        if not -2147483648 <= val <= 2147483647:
-          raise error.CompileError(f"invalid integer size: {val}", span)
+      case syntax.ScalarLiteral(text=text, kind=kind, span=span):
+        match kind:
+          case syntax.ScalarKind.I32:
+            val = int(text)
+            if not -2147483648 <= val <= 2147483647:
+              raise error.CompileError(f"invalid integer size: {val}", span)
 
-        node.set_typeinfo(BuiltinTypes.i32, False)
+            node.set_typeinfo(Prim(PrimKind.I32), False)
+
+          case syntax.ScalarKind.BOOL:
+            node.set_typeinfo(Prim(PrimKind.BOOL), False)
 
   def analyze_type(self, node: syntax.TypeExpr) -> TypeInfo:    
     match node:

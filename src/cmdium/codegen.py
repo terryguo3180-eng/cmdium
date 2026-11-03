@@ -484,6 +484,7 @@ class MCFuncBuilder:
   ) -> ScoreVar:
     if isinstance(place, lowering.ImmValue):
       return self.const_holder(int(place.val))
+    
     if place.temp:
       return ScoreVar(f"#{place.path}", self.objective)
     return ScoreVar(f"${place.path}", self.objective)

@@ -35,7 +35,7 @@ class Token:
 
 keywords = {
   "type", "struct", "func", "if", "else", "while", "break", "continue",
-  "return",
+  "return", "T", "F",
 }
 
 tokens_pat = re.compile(r"""
@@ -297,9 +297,15 @@ class Call(ExpressionBase):
   args: list[Expression]
 
 
+class ScalarKind(utils.DataEnum):
+  I32 = auto()
+  BOOL = auto()
+
+
 @dataclass
 class ScalarLiteral(ExpressionBase):
   text: str
+  kind: ScalarKind
 
 
 class TypeExprBase(AST):
@@ -853,6 +859,7 @@ class Parser:
   def parse_atom(self) -> Expression | None:
     # atom : NAME
     #      | INT
+    #      | "T" | "F"
     #      | "(" ~ expr ")"
 
     spos = self.curr_spos()
@@ -861,7 +868,17 @@ class Parser:
       return Name(name.text).write_span(self.file, spos, self.prev_epos())
 
     if tok := self.accept(TokenKind.INT):
-      return ScalarLiteral(tok.text).write_span(
+      return ScalarLiteral(tok.text, ScalarKind.I32).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    if tok := self.accept(TokenKind.KW, "T"):
+      return ScalarLiteral("T", ScalarKind.BOOL).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    if tok := self.accept(TokenKind.KW, "F"):
+      return ScalarLiteral("F", ScalarKind.BOOL).write_span(
         self.file, spos, self.prev_epos()
       )
 

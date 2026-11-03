@@ -569,11 +569,14 @@ class Lowering:
       case syntax.Name() | syntax.MemberAccess():
         return self.lower_lval(node)
 
-      case syntax.ScalarLiteral():
-        val = int(node.text)
-        layout = layout_of(node.type)
+      case syntax.ScalarLiteral(text=text, type=type):
+        layout = layout_of(type)
+
+        if type == semantic.Prim(semantic.PrimKind.BOOL):
+          text = "10"["TF".index(text)]
+
         assert isinstance(layout, Scalar)
-        return ImmValue(str(val), layout.type)
+        return ImmValue(text, layout.type)
 
   def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Place:
     match node:
