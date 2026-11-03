@@ -8,12 +8,13 @@ from typing import Any
 
 from cmdium import error
 from cmdium import syntax
-from cmdium.utils import DataEnum
+from cmdium import utils
 
 
-class PrimKind(DataEnum):
+class PrimKind(utils.DataEnum):
   I32 = auto()
   BOOL = auto()
+  STR = auto()
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ class BuiltinTypes:
   i32 = Prim(PrimKind.I32)
   bool = Prim(PrimKind.BOOL)
   void = Tuple(())
+  str = Prim(PrimKind.STR)
 
 
 def binop_type(
@@ -90,6 +92,11 @@ def binop_type(
     case (
       syntax.BinaryOp.CEQ | syntax.BinaryOp.CNE
     ), Prim(PrimKind.BOOL), Prim(PrimKind.BOOL):
+      return BuiltinTypes.bool
+
+    case (
+      syntax.BinaryOp.CEQ | syntax.BinaryOp.CNE
+    ), Prim(PrimKind.STR), Prim(PrimKind.STR):
       return BuiltinTypes.bool
 
     case (
@@ -156,7 +163,7 @@ def root_scope(file: str) -> Scope:
   scope = Scope()
   span = error.Span(file, 0, 0)
 
-  for name, type in vars(BuiltinTypes):
+  for name, type in vars(BuiltinTypes).items():
     if isinstance(type, TypeInfo):
       scope.declare_type(name, type, span)
   
@@ -224,7 +231,9 @@ class Semantic:
         self.analyze_expr(val)
 
         if not dst.lval:
-          raise error.CompileError("cannot assign to this expression", dst.span)
+          raise error.CompileError(
+            "cannot assign to this expression", dst.span
+          )
 
         dst_ty, val_ty = dst.type, val.type
         
@@ -239,7 +248,9 @@ class Semantic:
         self.analyze_expr(val)
 
         if not dst.lval:
-          raise error.CompileError("cannot assign to this expression", dst.span)
+          raise error.CompileError(
+            "cannot assign to this expression", dst.span
+          )
 
         dst_ty, val_ty = dst.type, val.type
         binop_type(bop, dst_ty, val_ty)
@@ -405,17 +416,19 @@ class Semantic:
 
         node.set_typeinfo(src.type.ret_type, False)
 
-      case syntax.ScalarLiteral(text=text, kind=kind, span=span):
-        match kind:
-          case syntax.ScalarKind.I32:
-            val = int(text)
+      case syntax.ScalarLiteral(val=val, span=span):
+        match val:
+          case utils.IntImm(val=val):
             if not -2147483648 <= val <= 2147483647:
               raise error.CompileError(f"invalid integer size: {val}", span)
 
             node.set_typeinfo(BuiltinTypes.i32, False)
 
-          case syntax.ScalarKind.BOOL:
+          case utils.BoolImm():
             node.set_typeinfo(BuiltinTypes.bool, False)
+
+          case utils.StrImm(val=val):
+            node.set_typeinfo(BuiltinTypes.str, False)
 
   def analyze_type(self, node: syntax.TypeExpr) -> TypeInfo:    
     match node:

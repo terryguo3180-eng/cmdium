@@ -121,7 +121,6 @@ class ScoreOp(DataEnum):
   SWP = auto()
 
 
-
 @dataclass(frozen=True)
 class Scoreboard:
   dst: ScoreVar
@@ -425,23 +424,6 @@ def _classify(bop: lowering.BinaryOp) -> ScoreOp | CompareOp:
     case lowering.BinaryOp.CGE: return CompareOp.CGE
 
 
-def _fold(bop: lowering.BinaryOp, a: int, b: int) -> int:
-  match bop:
-    case lowering.BinaryOp.ADD: return a + b
-    case lowering.BinaryOp.SUB: return a - b
-    case lowering.BinaryOp.MUL: return a * b
-    case lowering.BinaryOp.DIV: return a // b
-    case lowering.BinaryOp.MOD: return a % b
-    case lowering.BinaryOp.OR: return a | b
-    case lowering.BinaryOp.AND: return a & b
-    case lowering.BinaryOp.CEQ: return int(a == b)
-    case lowering.BinaryOp.CNE: return int(a != b)
-    case lowering.BinaryOp.CLT: return int(a < b)
-    case lowering.BinaryOp.CLE: return int(a <= b)
-    case lowering.BinaryOp.CGT: return int(a > b)
-    case lowering.BinaryOp.CGE: return int(a >= b)
-
-
 class MCFuncBuilder:
   def __init__(
     self,
@@ -480,9 +462,9 @@ class MCFuncBuilder:
     return ScoreVar(str(const), self.objective)
 
   def score_holder(
-    self, place: lowering.Place | lowering.ImmValue
+    self, place: lowering.Place | lowering.IntImm
   ) -> ScoreVar:
-    if isinstance(place, lowering.ImmValue):
+    if isinstance(place, lowering.IntImm):
       return self.const_holder(int(place.val))
     
     if place.temp:
@@ -504,16 +486,24 @@ class MCFuncBuilder:
           case lowering.ScalarType.INT:
             return self.score_holder(op)
 
-          case lowering.ScalarType.LABEL:
+          case (
+            lowering.ScalarType.LABEL |
+            lowering.ScalarType.STR |
+            lowering.ScalarType.FUNC
+          ):
             return NBTVar(op.path, self.stg)
 
-      case lowering.ImmValue(val=val):
-        match op.kind:
-          case lowering.ScalarType.INT:
-            return ScoreImm(int(val))
+      case lowering.IntImm(val=val):
+        return ScoreImm(int(val))
 
-          case lowering.ScalarType.LABEL:
-            return NBTImm(json.dumps(op.val))
+      case lowering.StrImm(val=val):
+        return NBTImm(json.dumps(val, ensure_ascii=False))
+
+      case lowering.LabelImm(bb=bb):
+        return NBTImm(json.dumps(bb.name, ensure_ascii=False))
+
+      case lowering.FuncImm(func=func):
+        return NBTImm(json.dumps(func.entry.name, ensure_ascii=False))
 
   def get_getcmd(self, var: CommandVar):
     match var:
@@ -557,8 +547,10 @@ class MCFuncBuilder:
     rhs: CommandOp,
   ) -> None:
     match dst, lhs, rhs:
-      case ScoreVar() as d, ScoreImm(val=a), ScoreImm(val=b):
-        self.emit(Scoreboard(d, ScoreOp.SET, ScoreImm(_fold(bop, a, b))))
+      case ScoreVar() as d, ScoreImm(val=a), ScoreImm(val=b) if (
+        (v := optimize.fold(bop, a, b)) is not None
+      ):
+        self.emit(Scoreboard(d, ScoreOp.SET, ScoreImm(v)))
 
       case (
         ScoreVar() as d,
@@ -726,12 +718,12 @@ class DatapackGen:
 
   def gen(self) -> dict[str, MCFunction]:
     for func in self.ir_funcs:
-      optimize.optimize(func)
-
       for block in func.blocks:
         block.scalarize()
 
-        block_name = block.addr.val
+      optimize.optimize(func)
+      for block in func.blocks:
+        block_name = block.name
         with self.with_func(block_name):
           for inst in block.body:
             self.gen_inst(inst)
@@ -761,8 +753,8 @@ class DatapackGen:
         assert isinstance(dst, CommandVar)
         self.fb.emit_binop(dst, lhs, bop, rhs)
 
-      case lowering.Call(callee=lowering.IRFunc(addr=addr)):
-        mcf = self.fb.get_cmdop(addr)
+      case lowering.Call(callee=callee):
+        mcf = self.fb.get_cmdop(callee)
         self.fb.emit_call(mcf)
       
       case lowering.IndirectCall(target=target):
@@ -772,13 +764,13 @@ class DatapackGen:
   def gen_term(self, term: lowering.Terminator):
     match term:
       case lowering.Jump(target=target):
-        mcf = self.fb.get_cmdop(target.addr)
+        mcf = self.fb.get_cmdop(target)
         self.fb.emit_jump(mcf, None)
 
       case lowering.Branch(cond=c, then=t, orelse=e):
         cond = self.fb.get_cmdop(c)
-        then = self.fb.get_cmdop(t.addr)
-        orelse = self.fb.get_cmdop(e.addr)
+        then = self.fb.get_cmdop(t)
+        orelse = self.fb.get_cmdop(e)
         self.fb.emit_jump(then, self.fb.get_cond(cond))
         self.fb.emit_jump(orelse, None)
 

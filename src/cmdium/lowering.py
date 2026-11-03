@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -8,12 +10,14 @@ from typing import cast
 
 from cmdium import semantic
 from cmdium import syntax
-from cmdium.utils import DataEnum
+from cmdium import utils
 
 
-class ScalarType(DataEnum):
+class ScalarType(utils.DataEnum):
   INT = auto()
   LABEL = auto()
+  FUNC = auto()
+  STR = auto()
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,9 @@ def layout_of(type: semantic.TypeInfo) -> Layout:
       match kind:
         case semantic.PrimKind.I32 | semantic.PrimKind.BOOL:
           return Scalar(ScalarType.INT)
+
+        case semantic.PrimKind.STR:
+          return Scalar(ScalarType.STR)
 
     case semantic.Tuple(fields=fields):
       return Aggregate(
@@ -82,24 +89,60 @@ class Place:
 
 
 @dataclass(frozen=True)
-class ImmValue:
-  val: str
-  kind: ScalarType
+class IntImm:
+  val: int
 
   @property
   def layout(self) -> Layout:
-    return Scalar(self.kind)
+    return Scalar(ScalarType.INT)
 
   def __str__(self):
-    return self.val
+    return str(self.val)
 
 
+@dataclass(frozen=True)
+class LabelImm:
+  bb: BasicBlock
+
+  @property
+  def layout(self) -> Layout:
+    return Scalar(ScalarType.LABEL)
+
+  def __str__(self):
+    return self.bb.name
+
+
+@dataclass(frozen=True)
+class FuncImm:
+  func: IRFunc
+
+  @property
+  def layout(self) -> Layout:
+    return Scalar(ScalarType.FUNC)
+
+  def __str__(self):
+    return self.func.name
+
+
+@dataclass(frozen=True)
+class StrImm:
+  val: str
+
+  @property
+  def layout(self) -> Layout:
+    return Scalar(ScalarType.STR)
+
+  def __str__(self):
+    return json.dumps(self.val, ensure_ascii=False)
+
+
+ImmValue = IntImm | LabelImm | FuncImm | StrImm
 Operand = Place | ImmValue
 
 
 class IRBase:
   def emit_leaves(self) -> Iterator[IR]:
-    yield cast("IR", self)
+    yield cast(IR, self)
 
 
 @dataclass
@@ -117,7 +160,7 @@ class Copy(IRBase):
         for d, s in zip(self.dst.leaves(), self.src.leaves()):
           yield Copy(d, s)
 
-      case ImmValue():
+      case IntImm() | LabelImm() | FuncImm() | StrImm():
         yield self
 
   def __str__(self):
@@ -131,13 +174,24 @@ class SetZero(IRBase):
   def emit_leaves(self) -> Iterator[IR]:
     for leaf in self.dst.leaves():
       assert isinstance(leaf.layout, Scalar)
-      yield Copy(leaf, ImmValue("0", leaf.layout.type))
+      match leaf.layout_type:
+        case ScalarType.INT:
+          yield Copy(leaf, IntImm(0))
+        case ScalarType.LABEL:
+          # '-.-', never used but valid
+          yield Copy(leaf, LabelImm(BasicBlock("-.-", [])))
+        case ScalarType.FUNC:
+          yield Copy(leaf, FuncImm(
+            IRFunc("-.-", [], Place(".", Aggregate(())), [])
+          ))
+        case ScalarType.STR:
+          yield Copy(leaf, StrImm(""))
 
   def __str__(self):
     return f"zero {self.dst!s}"
 
 
-class BinaryOp(DataEnum):
+class BinaryOp(utils.DataEnum):
   ADD = auto()  # +
   SUB = auto()  # -
   MUL = auto()  # *
@@ -185,13 +239,13 @@ class BinOp(IRBase):
 
 @dataclass
 class Jump:
-  target: BasicBlock
+  target: LabelImm
 
   def successors(self) -> Iterator[BasicBlock]:
-    yield self.target
+    yield self.target.bb
 
   def __str__(self):
-    return f"jump {self.target.addr!s}"
+    return f"jump {self.target!s}"
 
 
 @dataclass
@@ -212,18 +266,18 @@ class IndirectJump:
 @dataclass
 class Branch:
   cond: Place
-  then: BasicBlock
-  orelse: BasicBlock
+  then: LabelImm
+  orelse: LabelImm
 
   def __post_init__(self):
     assert self.cond.layout == Scalar(ScalarType.INT)
 
   def successors(self) -> Iterator[BasicBlock]:
-    yield self.then
-    yield self.orelse
+    yield self.then.bb
+    yield self.orelse.bb
 
   def __str__(self):
-    return f"br {self.cond!s} ? {self.then.addr!s} : {self.orelse.addr!s}"
+    return f"br {self.cond!s} ? {self.then!s} : {self.orelse!s}"
 
 
 @dataclass
@@ -237,7 +291,7 @@ class Ret:
 
 @dataclass(eq=False)
 class BasicBlock:
-  addr: ImmValue
+  name: str
   body: list[IR]
   term: Terminator | None = None
 
@@ -248,7 +302,7 @@ class BasicBlock:
     self.body = [leaf for inst in self.body for leaf in inst.emit_leaves()]
 
   def __str__(self):
-    s = f"{self.addr!s}:\n"
+    s = f"{self.name}:\n"
     for inst in self.body:
       s += f"  {inst!s}\n"
     if self.term is not None:
@@ -267,10 +321,6 @@ class IRFunc:
   def entry(self) -> BasicBlock:
     return self.blocks[0]
 
-  @property
-  def addr(self) -> Operand:
-    return self.entry.addr
-
   def __str__(self):
     s = f"func {self.name} {{\n"
     for inst in self.blocks:
@@ -282,10 +332,10 @@ class IRFunc:
 
 @dataclass
 class Call(IRBase):
-  callee: IRFunc
+  callee: FuncImm
 
   def __str__(self):
-    return f"call {self.callee.name}"
+    return f"call {self.callee!s}"
 
 
 @dataclass
@@ -313,10 +363,9 @@ class FuncBuilder:
     self.n_slots = 0
     self.cur = self.start(self.new_block("entry"))
 
-  def new_block(self, hint: str = "bb") -> BasicBlock:
+  def new_block(self, hint: str) -> BasicBlock:
     self.n_blocks += 1
-    addr = ImmValue(f"{self.name}/{hint}{self.n_blocks}", ScalarType.LABEL)
-    return BasicBlock(addr, [])
+    return BasicBlock(f"{self.name}/{hint}{self.n_blocks}", [])
 
   def param(self, name: str, layout: Layout) -> Place:
     p = self.var(name, layout)
@@ -338,7 +387,7 @@ class FuncBuilder:
       case Place():
         return op
       
-      case ImmValue():
+      case IntImm() | LabelImm() | FuncImm() | StrImm():
         tmp = self.temp(op.layout)
         self.emit(Copy(tmp, op))
         return tmp
@@ -353,15 +402,20 @@ class FuncBuilder:
 
   def goto(self, target: BasicBlock):
     if self.open:
-      self.set_term(Jump(target))
+      self.set_term(Jump(LabelImm(target)))
 
   def branch(self, cond: Operand, then: BasicBlock, orelse: BasicBlock):
     match cond:
-      case ImmValue(val=v):
-        self.goto(then if int(v) else orelse)
+      case IntImm(val=v):
+        self.goto(then if v else orelse)
+
+      case LabelImm() | FuncImm() | StrImm():
+        raise NotImplementedError
 
       case _:
-        self.set_term(Branch(self.as_place(cond), then, orelse))
+        self.set_term(
+          Branch(self.as_place(cond), LabelImm(then), LabelImm(orelse))
+        )
 
   @contextmanager
   def push_loop(self, break_b: BasicBlock, continue_b: BasicBlock):
@@ -390,10 +444,10 @@ class FuncBuilder:
   def _check_cfg(self):
     ids = {id(b) for b in self.func.blocks}
     for b in self.func.blocks:
-      assert b.term is not None, f"{b.addr!s}: no terminator"
+      assert b.term is not None, f"{b.name}: no terminator"
       for s in b.term.successors():
         assert id(s) in ids, \
-          f"{b.addr!s} -> {s.addr!s}: successor block not inside current func"
+          f"{b.name!s} -> {s!s}: successor block not inside current func"
 
   def finish(self) -> IRFunc:
     if self.open:
@@ -545,7 +599,7 @@ class Lowering:
       case syntax.UnaryExpr(val=val, uop=uop_node):
         v = self.lower_expr(val)
         dst = self.fb.temp(layout_of(node.type))
-        zero = ImmValue("0", ScalarType.INT)
+        zero = IntImm(0)
 
         match uop_node.uop:
           case syntax.UnaryOp.NEG:
@@ -564,7 +618,7 @@ class Lowering:
         for param, v in zip(callee.params, vals):
           self.fb.emit(Copy(param, v))
 
-        self.fb.emit(Call(callee))
+        self.fb.emit(Call(FuncImm(callee)))
 
         res = self.fb.temp(callee.ret.layout)
         self.fb.emit(Copy(res, callee.ret))
@@ -573,14 +627,22 @@ class Lowering:
       case syntax.Name() | syntax.MemberAccess():
         return self.lower_lval(node)
 
-      case syntax.ScalarLiteral(text=text, type=type):
+      case syntax.ScalarLiteral(val=v, type=type):
         layout = layout_of(type)
-
-        if type == semantic.BuiltinTypes.bool:
-          text = "10"["TF".index(text)]
-
         assert isinstance(layout, Scalar)
-        return ImmValue(text, layout.type)
+
+        match layout.type:
+          case ScalarType.INT:
+            assert isinstance(v, (utils.IntImm, utils.BoolImm))
+            return IntImm(int(v.val))
+
+          case ScalarType.STR:
+            assert isinstance(v, utils.StrImm)
+            return StrImm(v.val)
+
+          case ScalarType.FUNC | ScalarType.LABEL:
+            raise NotImplementedError
+
 
   def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Place:
     match node:

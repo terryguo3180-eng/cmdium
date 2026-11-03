@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-from typing import TypeIs
+from collections.abc import Iterator
 
 from cmdium import lowering
-
-
-def _wrap32(x: int) -> int:
-  return (x + 2**31) % 2**32 - 2**31
 
 
 def fold(bop: lowering.BinaryOp, a: int, b: int) -> int | None:
@@ -31,18 +27,13 @@ def fold(bop: lowering.BinaryOp, a: int, b: int) -> int | None:
     case lowering.BinaryOp.CLE: r = int(a <= b)
     case lowering.BinaryOp.CGT: r = int(a > b)
     case lowering.BinaryOp.CGE: r = int(a >= b)
-  
-  return _wrap32(r)
+    
+  return (r + 2**31) % 2**32 - 2**31
 
 
-def _imm(v: int) -> lowering.ImmValue:
-  return lowering.ImmValue(str(v), lowering.ScalarType.INT)
-
-
-def _is_int_imm(op: lowering.Operand) -> TypeIs[lowering.ImmValue]:
-  return (
-    isinstance(op, lowering.ImmValue) and op.kind == lowering.ScalarType.INT
-  )
+def _succ_blocks(term: lowering.Terminator) -> Iterator[lowering.BasicBlock]:
+  for s in term.successors():
+    yield s
 
 
 def prune_unreachable(func: lowering.IRFunc) -> None:
@@ -54,7 +45,7 @@ def prune_unreachable(func: lowering.IRFunc) -> None:
       continue
     seen.add(b)
     if b.term is not None:
-      stack.extend(b.term.successors())
+      stack.extend(_succ_blocks(b.term))
   func.blocks[:] = [b for b in func.blocks if b in seen]
 
 
@@ -63,13 +54,13 @@ def merge_blocks(func: lowering.IRFunc) -> None:
     preds = {b: 0 for b in func.blocks}
     for b in func.blocks:
       assert b.term is not None
-      for s in b.term.successors():
+      for s in _succ_blocks(b.term):
         preds[s] += 1
 
     for a in func.blocks:
       if not isinstance(a.term, lowering.Jump):
         continue
-      b = a.term.target
+      b = a.term.target.bb
       if b is a or b is func.entry or preds[b] != 1:
         continue
       a.body.extend(b.body)
@@ -106,37 +97,37 @@ def local_opt(block: lowering.BasicBlock) -> None:
         l, r = sub(l), sub(r)
         kill(d)
         v = None
-        if _is_int_imm(l) and _is_int_imm(r):
-          v = fold(bop, int(l.val), int(r.val))
+        if isinstance(l, lowering.IntImm) and isinstance(r, lowering.IntImm):
+          v = fold(bop, l.val, r.val)
         if v is not None:
-          c = _imm(v)
+          c = lowering.IntImm(v)
           env[d] = c
           out.append(lowering.Copy(d, c))
         else:
           out.append(lowering.BinOp(d, l, bop, r))
 
       case lowering.Call() | lowering.IndirectCall():
-        # a callee may write any global; only temps survive
         for k in [
           k for k, v in env.items()
-          if not (k.temp and (isinstance(v, lowering.ImmValue) or v.temp))
+          if not (k.temp and (not isinstance(v, lowering.Place) or v.temp))
         ]:
           del env[k]
         out.append(inst)
 
       case lowering.SetZero():
-        raise AssertionError("run lowering.scalarize before optimizing")
+        raise NotImplementedError
 
   block.body = out
 
   match block.term:
     case lowering.Branch(cond=c, then=t, orelse=e):
       c = sub(c)
-      if t is e:
+      if t == e:
         block.term = lowering.Jump(t)
-      elif isinstance(c, lowering.ImmValue):
-        block.term = lowering.Jump(t if int(c.val) else e)
+      elif isinstance(c, lowering.IntImm):
+        block.term = lowering.Jump(t if c.val else e)
       else:
+        assert isinstance(c, lowering.Place)
         block.term = lowering.Branch(c, t, e)
 
     case _:
@@ -162,7 +153,7 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
       match b.term:
         case lowering.Branch(cond=c):
           used.add(c)
-        case lowering.IndirectJump(target=t):
+        case lowering.Jump(target=t) | lowering.IndirectJump(target=t):
           used.add(t)
         case _:
           pass
@@ -172,7 +163,9 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
       keep: list[lowering.IR] = []
       for inst in b.body:
         match inst:
-          case lowering.Copy(dst=d) | lowering.BinOp(dst=d) if d.temp and d not in used:
+          case (
+            lowering.Copy(dst=d) | lowering.BinOp(dst=d)
+          ) if d.temp and d not in used:
             changed = True
           case _:
             keep.append(inst)

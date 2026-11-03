@@ -1,4 +1,6 @@
-from dataclasses import fields, is_dataclass
+import json
+
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any, cast
 
@@ -6,6 +8,33 @@ from typing import Any, cast
 class DataEnum(Enum):
   def __repr__(self):
     return f"{type(self).__name__}.{self.name}"
+
+
+@dataclass
+class IntImm:
+  val: int
+
+  def __str__(self):
+    return str(self.val)
+
+
+@dataclass
+class BoolImm:
+  val: bool
+
+  def __str__(self):
+    return "FT"[self.val]
+
+
+@dataclass
+class StrImm:
+  val: str
+
+  def __str__(self):
+    return json.dumps(self.val, ensure_ascii=False)  # double-quoted string
+
+
+Imm = IntImm | BoolImm | StrImm
 
 
 def _is_node(v: object) -> bool:
@@ -32,7 +61,7 @@ def _flat(v: object) -> str:
     body = " ".join(f"{k}={_flat(x)}" for k, x in items)
     return f"({name} {body})" if body else f"({name})"
   if isinstance(v, list):
-    return "[" + " ".join(_flat(x) for x in cast("list[object]", v)) + "]"
+    return "[" + " ".join(_flat(x) for x in cast(list[object], v)) + "]"
   return _leaf(v)
 
 
@@ -43,7 +72,7 @@ def _fmt(v: object, col: int, width: int) -> str:
 
   if isinstance(v, list):
     pad = "\n" + " " * (col + 1)
-    items = cast("list[object]", v)
+    items = cast(list[object], v)
     return "[" + pad.join(_fmt(x, col + 1, width) for x in items) + "]"
 
   pad = " " * (col + 2)
@@ -55,4 +84,3 @@ def _fmt(v: object, col: int, width: int) -> str:
 
 def dump(node: object, width: int = 80) -> str:
   return _fmt(node, 0, width)
-

@@ -15,6 +15,7 @@ from cmdium import utils
 
 class TokenKind(utils.DataEnum):
   INT = auto()
+  STR = auto()
   NAME = auto()
   KW = auto()
   OP = auto()
@@ -41,6 +42,7 @@ keywords = {
 tokens_pat = re.compile(r"""
     (?P<_>    \s+ | \#[^\n]*)
   | (?P<INT>  \d+)
+  | (?P<STR>  "(?:[^"\\\n]|\\.)*")
   | (?P<NAME> \w+)
   | (?P<OP>   \+= | -= | \*= | /= | %= | <= | >= | == | != | -> | := |
               \+ | - | \* | / | % | & | \| | = | ! | : | ; | \. | , | < | > |
@@ -54,6 +56,12 @@ def lex(src: str, file: str):
   while pos < n:
     match = tokens_pat.match(src, pos)
     if not match:
+      if src[pos] == '"':
+        end = src.find("\n", pos)
+        raise error.CompileError(
+          "unterminated string literal",
+          error.Span(file, pos, n if end < 0 else end),
+        )
       raise error.CompileError(
         "invalid character", error.Span(file, pos, pos + 1)
       )
@@ -69,6 +77,7 @@ def lex(src: str, file: str):
 
     kind = {
       "INT": TokenKind.INT,
+      "STR": TokenKind.STR,
       "NAME": TokenKind.NAME,
       "OP": TokenKind.OP,
     }[kind_str]
@@ -81,6 +90,48 @@ def lex(src: str, file: str):
     yield Token(kind, match.group(), file, spos)
 
   yield Token(TokenKind.EOF, "", file, pos)
+
+
+_HEX = frozenset("0123456789abcdefABCDEF")
+_ESCAPES = {
+  "\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t", "0": "\0",
+}
+
+
+def unescape(tok: Token) -> str:
+  body = tok.text[1:-1]
+  out: list[str] = []
+  i, n = 0, len(body)
+
+  def fail(msg: str, start: int, length: int):
+    s = tok.pos + 1 + start  # +1 skips the opening quote
+    raise error.CompileError(msg, error.Span(tok.file, s, s + length))
+
+  while i < n:
+    c = body[i]
+    if c != "\\":
+      out.append(c)
+      i += 1
+      continue
+
+    e = body[i + 1]  # the lexer guarantees a character after a backslash
+    if e in _ESCAPES:
+      out.append(_ESCAPES[e])
+      i += 2
+    elif e in "xu":
+      width = 2 if e == "x" else 4
+      digits = body[i + 2:i + 2 + width]
+      if len(digits) != width or not _HEX.issuperset(digits):
+        fail(f"\\{e} escape needs {width} hex digits", i, 2 + len(digits))
+      code = int(digits, 16)
+      if 0xD800 <= code <= 0xDFFF:
+        fail("surrogate code points are not allowed", i, 2 + width)
+      out.append(chr(code))
+      i += 2 + width
+    else:
+      fail(f"invalid escape sequence: \\{e}", i, 2)
+
+  return "".join(out)
 
 
 class AST:
@@ -300,12 +351,12 @@ class Call(ExpressionBase):
 class ScalarKind(utils.DataEnum):
   I32 = auto()
   BOOL = auto()
+  STR = auto()
 
 
 @dataclass
 class ScalarLiteral(ExpressionBase):
-  text: str
-  kind: ScalarKind
+  val: utils.Imm
 
 
 class TypeExprBase(AST):
@@ -882,6 +933,7 @@ class Parser:
   def parse_atom(self) -> Expression | None:
     # atom : NAME
     #      | INT
+    #      | STR
     #      | "T" | "F"
     #      | "(" ~ expr ")"
 
@@ -891,17 +943,26 @@ class Parser:
       return Name(name.text).write_span(self.file, spos, self.prev_epos())
 
     if tok := self.accept(TokenKind.INT):
-      return ScalarLiteral(tok.text, ScalarKind.I32).write_span(
+      imm = utils.IntImm(int(tok.text))
+      return ScalarLiteral(imm).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    if tok := self.accept(TokenKind.STR):
+      imm = utils.StrImm(unescape(tok))
+      return ScalarLiteral(imm).write_span(
         self.file, spos, self.prev_epos()
       )
 
     if tok := self.accept(TokenKind.KW, "T"):
-      return ScalarLiteral("T", ScalarKind.BOOL).write_span(
+      imm = utils.BoolImm(True)
+      return ScalarLiteral(imm).write_span(
         self.file, spos, self.prev_epos()
       )
 
     if tok := self.accept(TokenKind.KW, "F"):
-      return ScalarLiteral("F", ScalarKind.BOOL).write_span(
+      imm = utils.BoolImm(False)
+      return ScalarLiteral(imm).write_span(
         self.file, spos, self.prev_epos()
       )
 
@@ -920,11 +981,3 @@ def parse(src: str, file: str) -> CompilationUnit:
   parser = Parser(lexer, file)
   tree = parser.parse()
   return tree
-
-
-if __name__ == "__main__":
-  file = "../demos/test.cmdium"
-  with open(file) as f:
-    src = f.read()
-
-  print(parse(src, file))
