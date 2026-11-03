@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -16,7 +14,6 @@ from cmdium.utils import DataEnum
 class PrimKind(DataEnum):
   I32 = auto()
   BOOL = auto()
-  VOID = auto()
 
 
 @dataclass(frozen=True)
@@ -36,6 +33,14 @@ class Struct:
     return self.name
 
 
+@dataclass(eq=True)  # structual type
+class Tuple:
+  fields: tuple[TypeInfo, ...]
+
+  def __str__(self):
+    return f"({', '.join(str(f) for f in self.fields)})"
+
+
 @dataclass
 class Function:
   params: list[TypeInfo]
@@ -45,7 +50,7 @@ class Function:
     return f"({", ".join(str(p) for p in self.params)}) -> {self.ret_type!s}"
 
 
-TypeInfo = Prim | Struct | Function
+TypeInfo = Prim | Struct | Tuple | Function
 
 
 @dataclass(eq=False)
@@ -53,6 +58,11 @@ class Symbol:
   name: str
   type: TypeInfo
 
+
+class BuiltinTypes:
+  i32 = Prim(PrimKind.I32)
+  bool = Prim(PrimKind.BOOL)
+  void = Tuple(())
 
 
 def binop_type(
@@ -64,28 +74,28 @@ def binop_type(
       syntax.BinaryOp.MUL | syntax.BinaryOp.DIV |
       syntax.BinaryOp.MOD
     ), Prim(PrimKind.I32), Prim(PrimKind.I32):
-      return Prim(PrimKind.I32)
+      return BuiltinTypes.i32
 
     case (
       syntax.BinaryOp.CGT | syntax.BinaryOp.CLT |
       syntax.BinaryOp.CGE | syntax.BinaryOp.CLE
     ), Prim(PrimKind.I32), Prim(PrimKind.I32):
-      return Prim(PrimKind.BOOL)
+      return BuiltinTypes.bool
 
     case (
       syntax.BinaryOp.CEQ | syntax.BinaryOp.CNE
     ), Prim(PrimKind.I32), Prim(PrimKind.I32):
-      return Prim(PrimKind.BOOL)
+      return BuiltinTypes.bool
 
     case (
       syntax.BinaryOp.CEQ | syntax.BinaryOp.CNE
     ), Prim(PrimKind.BOOL), Prim(PrimKind.BOOL):
-      return Prim(PrimKind.BOOL)
+      return BuiltinTypes.bool
 
     case (
       syntax.BinaryOp.OR | syntax.BinaryOp.AND
     ), Prim(PrimKind.BOOL), Prim(PrimKind.BOOL):
-      return Prim(PrimKind.BOOL)
+      return BuiltinTypes.bool
 
     case _:
       raise error.CompileError(
@@ -96,10 +106,10 @@ def binop_type(
 def unaop_type(op: syntax.UnaryOpNode, val: TypeInfo) -> TypeInfo:
   match op.uop, val:
     case syntax.UnaryOp.NEG, Prim(PrimKind.I32):
-      return Prim(PrimKind.I32)
+      return BuiltinTypes.i32
 
     case syntax.UnaryOp.NOT, Prim(PrimKind.BOOL):
-      return Prim(PrimKind.BOOL)
+      return BuiltinTypes.bool
 
     case _:
       raise error.CompileError(
@@ -146,9 +156,9 @@ def root_scope(file: str) -> Scope:
   scope = Scope()
   span = error.Span(file, 0, 0)
 
-  scope.declare_type("i32", Prim(PrimKind.I32), span)
-  scope.declare_type("bool", Prim(PrimKind.BOOL), span)
-  scope.declare_type("void", Prim(PrimKind.VOID), span)
+  for name, type in vars(BuiltinTypes):
+    if isinstance(type, TypeInfo):
+      scope.declare_type(name, type, span)
   
   return scope
 
@@ -272,7 +282,7 @@ class Semantic:
         name_tok=name_tok,
       ):
         if ret_type is None:
-          return_type = Prim(PrimKind.VOID)
+          return_type = BuiltinTypes.void
         else:
           return_type = self.analyze_type(ret_type)
 
@@ -300,7 +310,7 @@ class Semantic:
 
       case syntax.If(test=test, body=body, orelse=orelse):
         self.analyze_expr(test)
-        if test.type != Prim(PrimKind.BOOL):
+        if test.type != BuiltinTypes.bool:
           raise error.CompileError(
             f"invalid type for if condition: {test.type!s} (must be bool)",
             test.span
@@ -318,7 +328,7 @@ class Semantic:
           raise error.CompileError("return statement outside function", span)
 
         if val is None:
-          val_ty = Prim(PrimKind.VOID)
+          val_ty = BuiltinTypes.void
           val_span = node.span
         else:
           self.analyze_expr(val)
@@ -334,7 +344,7 @@ class Semantic:
       case syntax.While(test=test, body=body):
         if test is not None:
           self.analyze_expr(test)
-          if test.type != Prim(PrimKind.BOOL):
+          if test.type != BuiltinTypes.bool:
             raise error.CompileError(
               f"invalid type for while condition: {test.type!s} (must be bool)",
               test.span
@@ -402,10 +412,10 @@ class Semantic:
             if not -2147483648 <= val <= 2147483647:
               raise error.CompileError(f"invalid integer size: {val}", span)
 
-            node.set_typeinfo(Prim(PrimKind.I32), False)
+            node.set_typeinfo(BuiltinTypes.i32, False)
 
           case syntax.ScalarKind.BOOL:
-            node.set_typeinfo(Prim(PrimKind.BOOL), False)
+            node.set_typeinfo(BuiltinTypes.bool, False)
 
   def analyze_type(self, node: syntax.TypeExpr) -> TypeInfo:    
     match node:
@@ -415,6 +425,9 @@ class Semantic:
           raise error.CompileError(f"undeclared type: {name!r}", span)
 
         return type
+
+      case syntax.TupleType(fields=fields, span=span):
+        return Tuple(tuple(self.analyze_type(f) for f in fields))
 
       case syntax.FuncType(params=params, ret_type=ret_type):
         return Function(

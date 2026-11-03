@@ -318,6 +318,11 @@ class NamedType(TypeExprBase):
 
 
 @dataclass
+class TupleType(TypeExprBase):
+  fields: list[TypeExpr]
+
+
+@dataclass
 class StructField(AST):
   name: str
   type: TypeExpr
@@ -340,7 +345,7 @@ Statement = Declaration | RawStatement
 Expression = (
   BinaryExpr | UnaryExpr | Name | MemberAccess | Call | ScalarLiteral
 )
-TypeExpr = NamedType | FuncType
+TypeExpr = NamedType | FuncType | TupleType
 
 
 class Parser:
@@ -668,8 +673,8 @@ class Parser:
 
   def parse_type(self) -> TypeExpr | None:
     # type : NAME
-    #      | "(" (type ("," type)*)? ~ ")" "->" type
-    #      | "(" type ~ ")"
+    #      | "func" ~ "(" (type ("," type)* ","?)? ")" "->" type
+    #      | "(" (type ("," type)* ","?)? ~ ")"
 
     spos = self.curr_spos()
 
@@ -678,9 +683,11 @@ class Parser:
         self.file, spos, self.prev_epos()
       )
 
-    if self.accept(TokenKind.OP, "("):
-      params: list[TypeExpr] = []
+    if self.accept(TokenKind.KW, "func"):
+      self.expect("'('", TokenKind.OP, "(")
+
       comma = False
+      params: list[TypeExpr] = []
       while type := self.parse_type():
         params.append(type)
         if not self.accept(TokenKind.OP, ","):
@@ -693,19 +700,31 @@ class Parser:
         TokenKind.OP, ")"
       )
 
+      self.expect("'->'", TokenKind.OP, "->")
+      type = self.expect_rule("type expression", self.parse_type)
+      return FuncType(params, type).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    if self.accept(TokenKind.OP, "("):
+      comma = False
+      fields: list[TypeExpr] = []
+      while type := self.parse_type():
+        fields.append(type)
+        if not self.accept(TokenKind.OP, ","):
+          break
+        else:
+          comma = True
+
+      self.expect(
+        "type expression or ')'" if comma else "',' or ')'",
+        TokenKind.OP, ")"
+      )
+
       if comma:
-        self.expect("'->'", TokenKind.OP, "->")
-        type = self.expect_rule("type expression", self.parse_type)
-        return FuncType(params, type).write_span(
-          self.file, spos, self.prev_epos()
-        )
+        return TupleType(fields).write_span(self.file, spos, self.prev_epos())
 
-      if self.accept(TokenKind.OP, "->") and (type := self.parse_type()):
-        return FuncType(params, type).write_span(
-          self.file, spos, self.prev_epos()
-        )
-
-      return params[0]  # grouped type
+      return fields[0]  # grouped type
 
     return None
 
@@ -826,14 +845,18 @@ class Parser:
     return None
 
   def parse_primary(self) -> Expression | None:
-    # primary : atom ("." ~ NAME | "(" args? ~ ")")*
+    # primary : atom ("." ~ (NAME | INT) | "(" args? ~ ")")*
     spos = self.curr_spos()
     if not (val := self.parse_atom()):
       return None
 
     while True:
       if self.accept(TokenKind.OP, "."):
-        att = self.expect("field name", TokenKind.NAME)
+        if name := self.accept(TokenKind.NAME):
+          att = name
+        else:
+          att = self.expect("field name or number", TokenKind.INT)
+
         val = MemberAccess(val, att.text).write_span(
           self.file, spos, self.prev_epos()
         )

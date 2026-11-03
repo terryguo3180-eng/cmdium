@@ -32,15 +32,19 @@ Layout = Scalar | Aggregate
 def layout_of(type: semantic.TypeInfo) -> Layout:
   match type:
     case semantic.Struct(fields=fields):
-      return Aggregate(tuple((n, layout_of(t)) for n, t in fields.items()))
+      return Aggregate(
+        tuple((n, layout_of(t)) for n, t in fields.items())
+      )
 
     case semantic.Prim(kind=kind):
       match kind:
         case semantic.PrimKind.I32 | semantic.PrimKind.BOOL:
           return Scalar(ScalarType.INT)
 
-        case semantic.PrimKind.VOID:
-          return Aggregate(())
+    case semantic.Tuple(fields=fields):
+      return Aggregate(
+        tuple((str(i), layout_of(t)) for i, t in enumerate(fields))
+      )
 
     case semantic.Function():
       raise NotImplementedError("function values have no layout yet")
@@ -311,7 +315,7 @@ class FuncBuilder:
 
   def new_block(self, hint: str = "bb") -> BasicBlock:
     self.n_blocks += 1
-    addr = ImmValue(f"{self.name}.{hint}{self.n_blocks}", ScalarType.LABEL)
+    addr = ImmValue(f"{self.name}/{hint}{self.n_blocks}", ScalarType.LABEL)
     return BasicBlock(addr, [])
 
   def param(self, name: str, layout: Layout) -> Place:
@@ -572,7 +576,7 @@ class Lowering:
       case syntax.ScalarLiteral(text=text, type=type):
         layout = layout_of(type)
 
-        if type == semantic.Prim(semantic.PrimKind.BOOL):
+        if type == semantic.BuiltinTypes.bool:
           text = "10"["TF".index(text)]
 
         assert isinstance(layout, Scalar)
