@@ -8,12 +8,12 @@ from enum import auto
 from functools import cached_property
 from typing import Self
 
-from cmdium.utils import DataEnum
 from cmdium import error
 from cmdium import semantic
+from cmdium import utils
 
 
-class TokenKind(DataEnum):
+class TokenKind(utils.DataEnum):
   INT = auto()
   NAME = auto()
   KW = auto()
@@ -34,14 +34,17 @@ class Token:
 
 
 keywords = {
-  "type", "struct",
+  "type", "struct", "func", "if", "else", "while", "break", "continue",
+  "return",
 }
 
 tokens_pat = re.compile(r"""
-    (?P<_>    \s+)
+    (?P<_>    \s+ | \#[^\n]*)
   | (?P<INT>  \d+)
   | (?P<NAME> \w+)
-  | (?P<OP>   \+ | - | \* | / | % | = | : | ; | \. | , | \( | \) | \{ | \} )
+  | (?P<OP>   \+= | -= | \*= | /= | %= | <= | >= | == | != | -> | := |
+              \+ | - | \* | / | % | & | \| | = | ! | : | ; | \. | , | < | > |
+              \( | \) | \[ | \] | \{ | \} )
 """, re.X)
 
 
@@ -51,7 +54,9 @@ def lex(src: str, file: str):
   while pos < n:
     match = tokens_pat.match(src, pos)
     if not match:
-      raise error.CompileError("invalid character", error.Span(file, pos, pos + 1))
+      raise error.CompileError(
+        "invalid character", error.Span(file, pos, pos + 1)
+      )
 
     spos = pos
     pos = match.end()
@@ -81,9 +86,12 @@ def lex(src: str, file: str):
 class AST:
   span: error.Span
 
-  def write_span(self, file, spos, epos) -> Self:
+  def write_span(self, file: str, spos: int, epos: int) -> Self:
     self.span = error.Span(file, spos, epos)
     return self
+
+  def __str__(self):
+    return utils.dump(self)
 
 
 @dataclass
@@ -91,15 +99,24 @@ class CompilationUnit(AST):
   body: list[Statement]
 
 
-class Statement(AST):
+class StatementBase(AST):
+  ...
+
+
+class RawStatementBase(StatementBase):
+  ...
+
+
+class DeclarationBase(StatementBase):
   ...
 
 
 @dataclass
-class VarDecl(Statement):
+class VarDecl(DeclarationBase):
   name: str
   type: TypeExpr
   init: Expression | None
+  name_tok: Token
 
   sym: semantic.Symbol = field(init=False, repr=False)
 
@@ -108,24 +125,102 @@ class VarDecl(Statement):
 
 
 @dataclass
-class TypeDecl(Statement):
+class TypeDecl(DeclarationBase):
   name: str
   type: TypeExpr
+  name_tok: Token
 
 
 @dataclass
-class StructDecl(Statement):
+class StructDecl(DeclarationBase):
   name: str
   fields: list[StructField]
+  name_tok: Token
 
 
 @dataclass
-class Assign(Statement):
+class FuncDecl(DeclarationBase):
+  name: str
+  params: list[FuncParam]
+  ret_type: TypeExpr | None
+  body: Block
+  name_tok: Token
+
+  sym: semantic.Symbol = field(init=False, repr=False)
+
+  def set_symbol(self, sym: semantic.Symbol):
+    self.sym = sym
+
+
+@dataclass
+class FuncParam(AST):
+  name: str
+  type: TypeExpr
+  name_tok: Token
+
+  sym: semantic.Symbol = field(init=False, repr=False)
+
+  def set_symbol(self, sym: semantic.Symbol):
+    self.sym = sym
+
+
+@dataclass
+class If(RawStatementBase):
+  test: Expression
+  body: RawStatement
+  orelse: RawStatement | None
+
+
+@dataclass
+class While(RawStatementBase):
+  test: Expression | None
+  body: RawStatement
+
+
+@dataclass
+class Block(RawStatementBase):
+  body: list[Statement]
+
+
+@dataclass
+class Break(RawStatementBase):
+  ...
+
+
+@dataclass
+class Continue(RawStatementBase):
+  ...
+
+
+@dataclass
+class Return(RawStatementBase):
+  val: Expression | None
+
+
+@dataclass
+class Pass(RawStatementBase):
+  ...
+
+
+@dataclass
+class Assign(RawStatementBase):
   dst: Expression
   val: Expression
 
 
-class Expression(AST):
+@dataclass
+class AugAssign(RawStatementBase):
+  dst: Expression
+  bop: BinaryOpNode
+  val: Expression
+
+
+@dataclass
+class ExprStmt(RawStatementBase):
+  val: Expression
+
+
+class ExpressionBase(AST):
   type: semantic.TypeInfo
   lval: bool
 
@@ -134,12 +229,22 @@ class Expression(AST):
     self.lval = lval
 
 
-class BinaryOp(DataEnum):
-  ADD = auto()
-  SUB = auto()
-  MUL = auto()
-  DIV = auto()
-  MOD = auto()
+class BinaryOp(utils.DataEnum):
+  ADD = auto()  # +
+  SUB = auto()  # -
+  MUL = auto()  # *
+  DIV = auto()  # /
+  MOD = auto()  # %
+  
+  OR = auto()   # |
+  AND = auto()  # &
+
+  CLT = auto()  # <
+  CGT = auto()  # >
+  CLE = auto()  # <=
+  CGE = auto()  # >=
+  CEQ = auto()  # ==
+  CNE = auto()  # !=
 
 
 @dataclass
@@ -148,14 +253,30 @@ class BinaryOpNode(AST):
 
 
 @dataclass
-class BinaryExpr(Expression):
+class BinaryExpr(ExpressionBase):
   lhs: Expression
   bop: BinaryOpNode
   rhs: Expression
 
 
+class UnaryOp(utils.DataEnum):
+  NEG = auto()
+  NOT = auto()
+
+
 @dataclass
-class Name(Expression):
+class UnaryOpNode(AST):
+  uop: UnaryOp
+
+
+@dataclass
+class UnaryExpr(ExpressionBase):
+  uop: UnaryOpNode
+  val: Expression
+
+
+@dataclass
+class Name(ExpressionBase):
   name: str
 
   sym: semantic.Symbol = field(init=False, repr=False)
@@ -165,22 +286,28 @@ class Name(Expression):
 
 
 @dataclass
-class MemberAccess(Expression):
+class MemberAccess(ExpressionBase):
   src: Expression
   att: str
 
 
 @dataclass
-class ScalarLiteral(Expression):
+class Call(ExpressionBase):
+  src: Expression
+  args: list[Expression]
+
+
+@dataclass
+class ScalarLiteral(ExpressionBase):
   text: str
 
 
-class TypeExpr(AST):
+class TypeExprBase(AST):
   ...
 
 
 @dataclass
-class NamedType(TypeExpr):
+class NamedType(TypeExprBase):
   name: str
 
 
@@ -189,12 +316,49 @@ class StructField(AST):
   name: str
   type: TypeExpr
 
+  name_tok: Token
+
+
+@dataclass
+class FuncType(TypeExprBase):
+  params: list[TypeExpr]
+  ret_type: TypeExpr
+
+
+Declaration = VarDecl | TypeDecl | StructDecl | FuncDecl
+RawStatement = (
+  If | While | Block | Break | Continue | Return | Pass | Assign | AugAssign |
+  ExprStmt
+)
+Statement = Declaration | RawStatement
+Expression = (
+  BinaryExpr | UnaryExpr | Name | MemberAccess | Call | ScalarLiteral
+)
+TypeExpr = NamedType | FuncType
+
 
 class Parser:
   def __init__(self, lexer: Iterable[Token], file: str):
     self.toks = list(lexer)
     self.file = file
     self.pos: int = 0
+
+    self.expr_precedence: dict[str, tuple[int, BinaryOp]] = {
+      "|": (0, BinaryOp.OR),
+      "&": (1, BinaryOp.AND),
+      "==": (2, BinaryOp.CEQ), "!=": (2, BinaryOp.CNE),
+      "<": (3, BinaryOp.CLT), ">": (3, BinaryOp.CGT),
+      "<=": (3, BinaryOp.CLE), ">=": (3, BinaryOp.CGE),
+      "+": (4, BinaryOp.ADD), "-": (4, BinaryOp.SUB),
+      "*": (5, BinaryOp.MUL), "/": (5, BinaryOp.DIV), "%": (5, BinaryOp.MOD),
+    }
+    self.augassign_ops: dict[str, BinaryOp] = {
+      "+=": BinaryOp.ADD,
+      "-=": BinaryOp.SUB,
+      "*=": BinaryOp.MUL,
+      "/=": BinaryOp.DIV,
+      "%=": BinaryOp.MOD,
+    }
 
   def tell(self) -> int:
     return self.pos
@@ -250,18 +414,138 @@ class Parser:
     return CompilationUnit(body).write_span(self.file, spos, self.prev_epos())
 
   def parse_stmt(self) -> Statement | None:
-    # stmt : var_decl
-    #      | type_decl
-    #      | assign
-
-    if decl := self.parse_var_decl():
+    # stmt : decl
+    #      | raw_stmt
+    
+    if decl := self.parse_decl():
       return decl
+
+    if stmt := self.parse_raw_stmt():
+      return stmt
+
+    return None
+
+  def parse_raw_stmt(self) -> RawStatement | None:
+    # raw_stmt : block
+    #          | if
+    #          | while
+    #          | "break" ~ ";"
+    #          | "continue" ~ ";"
+    #          | "return" ~ expr ";"
+    #          | assign
+    #          | aug_assign
+    #          | expr ~ ";"
+    #          | ";"
+
+    spos = self.curr_spos()
+
+    if block := self.parse_block():
+      return block
+
+    if if_ := self.parse_if():
+      return if_
+
+    if while_ := self.parse_while():
+      return while_
+
+    if self.accept(TokenKind.KW, "break"):
+      self.expect("';'", TokenKind.OP, ";")
+      return Break().write_span(self.file, spos, self.prev_epos())
+
+    if self.accept(TokenKind.KW, "continue"):
+      self.expect("';'", TokenKind.OP, ";")
+      return Continue().write_span(self.file, spos, self.prev_epos())
+
+    if self.accept(TokenKind.KW, "return"):
+      expr = self.parse_expr()
+      self.expect("';'" if expr else "expression or ';'", TokenKind.OP, ";")
+      return Return(expr).write_span(self.file, spos, self.prev_epos())
+
+    if assign := self.parse_assign():
+      return assign
+
+    if aug := self.parse_aug_assign():
+      return aug
+
+    if val := self.parse_expr():
+      self.expect("';'", TokenKind.OP, ";")
+      return ExprStmt(val).write_span(self.file, spos, self.prev_epos())
+
+    if tok := self.accept(TokenKind.OP, ";"):
+      return Pass().write_span(*tok.span)
+
+    return None
+
+  def parse_block(self):
+    # block : "{" ~ stmt* "}"
+    spos = self.curr_spos()
+
+    if self.accept(TokenKind.OP, "{"):
+      body: list[Statement] = []
+      while stmt := self.parse_stmt():
+        body.append(stmt)
+
+      self.expect("'}'", TokenKind.OP, "}")
+      return Block(body).write_span(self.file, spos, self.prev_epos())
+
+    return None
+
+  def parse_if(self):
+    # if : "if" ~ "(" expr ")" raw_stmt ("else" ~ raw_stmt)?
+    spos = self.curr_spos()
+
+    if self.accept(TokenKind.KW, "if"):
+      self.expect("'('", TokenKind.OP, "(")
+      test = self.expect_rule("expression", self.parse_expr)
+      self.expect("')'", TokenKind.OP, ")")
+      body = self.expect_rule(
+        "statement other than declaration", self.parse_raw_stmt
+      )
+      if self.accept(TokenKind.KW, "else"):
+        orelse = self.expect_rule(
+          "statement other than declaration", self.parse_raw_stmt
+        )
+      else:
+        orelse = None
+
+      return If(test, body, orelse).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    return None
+
+  def parse_while(self):
+    # while : "while" ~ ("(" ~ expr ")")? raw_stmt
+    spos = self.curr_spos()
+
+    if self.accept(TokenKind.KW, "while"):
+      if self.accept(TokenKind.OP, "("):
+        test = self.expect_rule("expression", self.parse_expr)
+        self.expect("')'", TokenKind.OP, ")")
+        body_msg = "statement other than declaration"
+      else:
+        test = None
+        body_msg = "'(' or statement other than declaration"
+
+      body = self.expect_rule(body_msg, self.parse_raw_stmt)
+
+      return While(test, body).write_span(self.file, spos, self.prev_epos())
+
+    return None
+
+  def parse_decl(self) -> Declaration | None:
+    # decl : var_decl
+    #      | type_decl
+    #      | func_decl
+    
+    if var_decl := self.parse_var_decl():
+      return var_decl
 
     if type_decl := self.parse_type_decl():
       return type_decl
 
-    if assign := self.parse_assign():
-      return assign
+    if func_decl := self.parse_func_decl():
+      return func_decl
 
     return None
 
@@ -285,7 +569,7 @@ class Parser:
 
       self.expect(sm_msg, TokenKind.OP, ";")
 
-      return VarDecl(name.text, type, init).write_span(
+      return VarDecl(name.text, type, init, name).write_span(
         self.file, spos, self.prev_epos()
       )
 
@@ -304,7 +588,7 @@ class Parser:
       self.expect("'='", TokenKind.OP, "=")
       type = self.expect_rule("type expression", self.parse_type)
       self.expect("';'", TokenKind.OP, ";")
-      return TypeDecl(name.text, type).write_span(
+      return TypeDecl(name.text, type, name).write_span(
         self.file, spos, self.prev_epos()
       )
 
@@ -318,15 +602,69 @@ class Parser:
 
       self.expect(cb_msg, TokenKind.OP, "}")
       self.expect("';'", TokenKind.OP, ";")
-      return StructDecl(name.text, fields).write_span(
+      return StructDecl(name.text, fields, name).write_span(
         self.file, spos, self.prev_epos()
       )
 
     self.seek(mark)
     return None
 
+  def parse_func_decl(self) -> FuncDecl | None:
+    # func_decl : "func" ~ NAME "(" params? ~ ")" ("->" ~ type)? block
+
+    spos = self.curr_spos()
+
+    if not self.accept(TokenKind.KW, "func"):
+      return None
+
+    name = self.expect("function name", TokenKind.NAME)
+    self.expect("'('", TokenKind.OP, "(")
+
+    params = self.parse_params() or []
+    self.expect("')'" if params else "parameters or ')'", TokenKind.OP, ")")
+
+    if self.accept(TokenKind.OP, "->"):
+      ret_type = self.expect_rule("type expression", self.parse_type)
+      body_msg = "block"
+    else:
+      ret_type = None
+      body_msg = "'->' or block"
+
+    body = self.expect_rule(body_msg, self.parse_block)
+    return FuncDecl(name.text, params, ret_type, body, name).write_span(
+      self.file, spos, self.prev_epos()
+    )
+
+  def parse_params(self) -> list[FuncParam] | None:
+    # params : param ("," param)* ","?
+    params: list[FuncParam] = []
+    while param := self.parse_param():
+      params.append(param)
+      if not self.accept(TokenKind.OP, ","):
+        break
+
+    return params
+
+  def parse_param(self) -> FuncParam | None:
+    # param : NAME ~ ":" type
+
+    spos = self.curr_spos()
+
+    if not (name := self.accept(TokenKind.NAME)):
+      return None
+
+    self.expect("':'", TokenKind.OP, ":")
+    type = self.expect_rule("type expression", self.parse_type)
+
+    return FuncParam(name.text, type, name).write_span(
+      self.file, spos, self.prev_epos()
+    )
+
   def parse_type(self) -> TypeExpr | None:
     # type : NAME
+    #      | "(" (type ("," type)*)? ~ ")" "->" type
+    #      | "(" type ~ ")"
+
     spos = self.curr_spos()
 
     if name := self.accept(TokenKind.NAME):
@@ -334,12 +672,40 @@ class Parser:
         self.file, spos, self.prev_epos()
       )
 
+    if self.accept(TokenKind.OP, "("):
+      params: list[TypeExpr] = []
+      comma = False
+      while type := self.parse_type():
+        params.append(type)
+        if not self.accept(TokenKind.OP, ","):
+          break
+        else:
+          comma = True
+
+      self.expect(
+        "type expression or ')'" if comma else "',' or ')'",
+        TokenKind.OP, ")"
+      )
+
+      if comma:
+        self.expect("'->'", TokenKind.OP, "->")
+        type = self.expect_rule("type expression", self.parse_type)
+        return FuncType(params, type).write_span(
+          self.file, spos, self.prev_epos()
+        )
+
+      if self.accept(TokenKind.OP, "->") and (type := self.parse_type()):
+        return FuncType(params, type).write_span(
+          self.file, spos, self.prev_epos()
+        )
+
+      return params[0]  # grouped type
+
     return None
 
   def parse_struct_fields(self) -> list[StructField]:
-    # struct_fields : struct_field "," struct_fields
-    #               | struct_field ","?
-    fields = []
+    # struct_fields : struct_field ("," struct_field)* ","?
+    fields: list[StructField] = []
     while f := self.parse_struct_field():
       fields.append(f)
       if not self.accept(TokenKind.OP, ","):
@@ -357,7 +723,7 @@ class Parser:
       and self.accept(TokenKind.OP, ":")
     ):
       type = self.expect_rule("type expression", self.parse_type)
-      return StructField(name.text, type).write_span(
+      return StructField(name.text, type, name).write_span(
         self.file, spos, self.prev_epos()
       )
 
@@ -380,80 +746,109 @@ class Parser:
     self.seek(mark)
     return None
 
-  def parse_expr(self) -> Expression | None:
-    # expr : term (("+" | "-") &&term)*
+  def parse_aug_assign(self) -> AugAssign | None:
+    # aug_assign : expr augop ~ expr ";"
     mark = self.tell()
     spos = self.curr_spos()
 
-    if not (lhs := self.parse_term()):
-      self.seek(mark)
+    if (
+      (dst := self.parse_expr())
+      and (bop := self.parse_augop())
+    ):
+      val = self.expect_rule("expression", self.parse_expr)
+      self.expect("';'", TokenKind.OP, ";")
+      return AugAssign(dst, bop, val).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    self.seek(mark)
+    return None
+
+  def parse_augop(self) -> BinaryOpNode | None:
+    # augop : "+=" | "-=" | "*=" | "/=" | "%="
+    for s, op in self.augassign_ops.items():
+      if tok := self.accept(TokenKind.OP, s):
+        return BinaryOpNode(op).write_span(*tok.span)
+
+    return None
+
+  def parse_expr(self, min_prec: int = 0) -> Expression | None:
+    spos = self.curr_spos()
+
+    if not (lhs := self.parse_unary()):
       return None
 
     while True:
-      mark = self.tell()
-
-      if tok := self.accept(TokenKind.OP, "+"):
-        op = BinaryOpNode(BinaryOp.ADD).write_span(*tok.span)
-
-      elif tok := self.accept(TokenKind.OP, "-"):
-        op = BinaryOpNode(BinaryOp.SUB).write_span(*tok.span)
-
-      else:
+      tok = self.current_tok()
+      entry = (
+        self.expr_precedence.get(tok.text)
+        if tok.kind == TokenKind.OP
+        else None
+      )
+      if entry is None or entry[0] < min_prec:
         break
 
-      rhs = self.expect_rule("term expression", self.parse_term)
-      lhs = BinaryExpr(lhs, op, rhs).write_span(
+      prec, op = entry
+      self.accept(TokenKind.OP, tok.text)
+      bop = BinaryOpNode(op).write_span(*tok.span)
+
+      rhs = self.expect_rule("expression", lambda: self.parse_expr(prec + 1))
+      lhs = BinaryExpr(lhs, bop, rhs).write_span(
         self.file, spos, self.prev_epos()
       )
 
     return lhs
 
-  def parse_term(self) -> Expression | None:
-    # term : primary (("*" | "/" | "%") &&primary)*
-    mark = self.tell()
+  def parse_unary(self) -> Expression | None:
+    # unary : ("-" | "!") ~ unary
+    #       | primary
     spos = self.curr_spos()
 
-    if not (lhs := self.parse_primary()):
-      self.seek(mark)
-      return None
+    if op := self.accept(TokenKind.OP, "-"):
+      val = self.expect_rule("unary expression", self.parse_unary)
+      uop = UnaryOpNode(UnaryOp.NEG).write_span(*op.span)
+      return UnaryExpr(uop, val).write_span(self.file, spos, self.prev_epos())
 
-    while True:
-      mark = self.tell()
+    if op := self.accept(TokenKind.OP, "!"):
+      val = self.expect_rule("unary expression", self.parse_unary)
+      uop = UnaryOpNode(UnaryOp.NOT).write_span(*op.span)
+      return UnaryExpr(uop, val).write_span(self.file, spos, self.prev_epos())
 
-      if tok := self.accept(TokenKind.OP, "*"):
-        op = BinaryOpNode(BinaryOp.MUL).write_span(*tok.span)
-      
-      elif tok := self.accept(TokenKind.OP, "/"):
-        op = BinaryOpNode(BinaryOp.DIV).write_span(*tok.span)
+    if primary := self.parse_primary():
+      return primary
 
-      elif tok := self.accept(TokenKind.OP, "%"):
-        op = BinaryOpNode(BinaryOp.MOD).write_span(*tok.span)
-      
-      else:
-        break
-
-      rhs = self.expect_rule("primary expression", self.parse_primary)
-      lhs = BinaryExpr(lhs, op, rhs).write_span(
-        self.file, spos, self.prev_epos()
-      )
-
-    return lhs
+    return None
 
   def parse_primary(self) -> Expression | None:
-    # primary : atom ("." &&NAME)*
-
+    # primary : atom ("." ~ NAME | "(" args? ~ ")")*
     spos = self.curr_spos()
-
     if not (val := self.parse_atom()):
       return None
-    
-    while self.accept(TokenKind.OP, "."):
-      att = self.expect("field name", TokenKind.NAME)
-      val = MemberAccess(val, att.text).write_span(
-        self.file, spos, self.prev_epos()
-      )
 
-    return val
+    while True:
+      if self.accept(TokenKind.OP, "."):
+        att = self.expect("field name", TokenKind.NAME)
+        val = MemberAccess(val, att.text).write_span(
+          self.file, spos, self.prev_epos()
+        )
+      elif self.accept(TokenKind.OP, "("):
+        args = self.parse_args() or []
+        self.expect(
+          "')'" if args else "arguments or ')'", TokenKind.OP, ")"
+        )
+        val = Call(val, args).write_span(self.file, spos, self.prev_epos())
+      else:
+        return val
+
+  def parse_args(self) -> list[Expression] | None:
+    # args : expr ("," expr)* ","?
+    args: list[Expression] = []
+    while arg := self.parse_expr():
+      args.append(arg)
+      if not self.accept(TokenKind.OP, ","):
+        break
+
+    return args
 
   def parse_atom(self) -> Expression | None:
     # atom : NAME
@@ -465,8 +860,8 @@ class Parser:
     if name := self.accept(TokenKind.NAME):
       return Name(name.text).write_span(self.file, spos, self.prev_epos())
 
-    if int := self.accept(TokenKind.INT):
-      return ScalarLiteral(int.text).write_span(
+    if tok := self.accept(TokenKind.INT):
+      return ScalarLiteral(tok.text).write_span(
         self.file, spos, self.prev_epos()
       )
 
@@ -488,10 +883,8 @@ def parse(src: str, file: str) -> CompilationUnit:
 
 
 if __name__ == "__main__":
-  from pprint import pprint
-
   file = "../demos/test.cmdium"
   with open(file) as f:
     src = f.read()
 
-  pprint(parse(src, file))
+  print(parse(src, file))

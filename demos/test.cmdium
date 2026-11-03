@@ -1,19 +1,11 @@
-a: i32 = 1;
-c: i32 = 5;
-b: i32 = 7;
-d: i32 = a + b * c / (a - b) % 3;
-
-struct Vel {
-  vx: i32,
-  vy: i32,
-};
-
-struct Point {
-  x: i32,
-  y: i32,
-  vel: Vel
-};
-p: Point;
-q: Point = p;
-v: Vel;
-p.vel = vl;
+i: i32 = 0;
+while (i < 3) {
+  i += 1;
+  continue;
+  i += 100;
+}
+func f() -> i32 {
+  return 1;
+  return 2;
+}
+r: i32 = f();

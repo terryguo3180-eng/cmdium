@@ -1,0 +1,8 @@
+- merge the conditions into one single chain of `/execute` instead of computing
+  it using `/scoreboard`
+
+- if the return type is int, use plain `/return {val}` and capture it with
+  `/execute store result score ... run function ...`
+
+- merge `if score {x} matches 1.. if score {x} matches ..10` into
+  `if score {x} matches 1..10`

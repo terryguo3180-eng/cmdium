@@ -7,11 +7,20 @@ class Span(NamedTuple):
   epos: int
 
 
-class CompileError(Exception):
+class CompileException(Exception):
   def __init__(self, msg: str, span: Span):
     super().__init__(msg)
     self.msg = msg
     self.span = span
+
+
+class CompileError(CompileException):
+  ...
+
+
+class CompileWarning(UserWarning, CompileException):
+  def __init__(self, msg: str, span: Span):
+    CompileException.__init__(self, msg, span)
 
 
 def get_lines(
@@ -20,7 +29,7 @@ def get_lines(
   if spos >= epos:
     return []
 
-  lines = []
+  lines: list[tuple[int, str, int, int]] = []
   i = 0
   for ln, line in enumerate(src.split("\n"), 1):
     if i < epos and i + len(line) >= spos:
@@ -33,14 +42,15 @@ def get_lines(
   return lines
 
 
-_RESET      = "\x1b[0m"
-_BOLD       = "\x1b[1m"
-_GRAY       = "\x1b[90m"
-_BOLD_RED   = "\x1b[1;31m"
-_BOLD_BLUE  = "\x1b[1;34m"
+_RESET = "\x1b[0m"
+_BOLD = "\x1b[1m"
+_GRAY = "\x1b[90m"
+_BOLD_RED = "\x1b[1;31m"
+_BOLD_YELLOW = "\x1b[1;33m"
+_BOLD_BLUE = "\x1b[1;34m"
 
 
-def format_error(err: CompileError, colored: bool = False):
+def format_error(err: CompileError | CompileWarning, colored: bool = False):
   file, spos, epos = err.span
   epos = max(epos, spos + 1)
 
@@ -56,7 +66,13 @@ def format_error(err: CompileError, colored: bool = False):
     return f"{code}{text}{_RESET}"
 
   loc = f"{file}:{ln}:{cl}"
-  fmt = f"{paint(loc, _BOLD)}: {paint('error', _BOLD_RED)}: {err.msg}\n"
+
+  if isinstance(err, CompileError):
+    title = paint("error", _BOLD_RED)
+  else:
+    title = paint("warning", _BOLD_YELLOW)
+
+  fmt = f"{paint(loc, _BOLD)}: {title}: {err.msg}\n"
 
   maxln = src.count("\n") + 1
   leadz = len(str(maxln))
