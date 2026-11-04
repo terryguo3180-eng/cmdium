@@ -428,11 +428,17 @@ class Parser:
     self.expr_precedence: dict[str, tuple[int, BinaryOp]] = {
       "|": (0, BinaryOp.OR),
       "&": (1, BinaryOp.AND),
-      "==": (2, BinaryOp.CEQ), "!=": (2, BinaryOp.CNE),
-      "<": (3, BinaryOp.CLT), ">": (3, BinaryOp.CGT),
-      "<=": (3, BinaryOp.CLE), ">=": (3, BinaryOp.CGE),
-      "+": (4, BinaryOp.ADD), "-": (4, BinaryOp.SUB),
-      "*": (5, BinaryOp.MUL), "/": (5, BinaryOp.DIV), "%": (5, BinaryOp.MOD),
+      "==": (2, BinaryOp.CEQ),
+      "!=": (2, BinaryOp.CNE),
+      "<": (3, BinaryOp.CLT),
+      ">": (3, BinaryOp.CGT),
+      "<=": (3, BinaryOp.CLE),
+      ">=": (3, BinaryOp.CGE),
+      "+": (4, BinaryOp.ADD),
+      "-": (4, BinaryOp.SUB),
+      "*": (5, BinaryOp.MUL),
+      "/": (5, BinaryOp.DIV),
+      "%": (5, BinaryOp.MOD),
     }
     self.augassign_ops: dict[str, BinaryOp] = {
       "+=": BinaryOp.ADD,

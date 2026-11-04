@@ -72,15 +72,21 @@ def merge_blocks(func: lowering.IRFunc) -> None:
 
 
 def local_opt(block: lowering.BasicBlock) -> None:
-  env: dict[lowering.Place, lowering.Operand] = {}
+  env: dict[lowering.Var, lowering.Operand] = {}
 
   def sub(op: lowering.Operand) -> lowering.Operand:
-    return env.get(op, op) if isinstance(op, lowering.Place) else op
+    return env.get(op, op) if isinstance(op, lowering.Var) else op
 
-  def kill(p: lowering.Place) -> None:
+  def kill(p: lowering.Var) -> None:
     env.pop(p, None)
     for k in [k for k, v in env.items() if v == p]:
       del env[k]
+
+  def invalidate_for_call() -> None:
+    for k, v in list(env.items()):
+      stable = k.temp and (not isinstance(v, lowering.Var) or v.temp)
+      if not stable:
+        del env[k]
 
   out: list[lowering.IR] = []
   for inst in block.body:
@@ -106,16 +112,17 @@ def local_opt(block: lowering.BasicBlock) -> None:
         else:
           out.append(lowering.BinOp(d, l, bop, r))
 
-      case lowering.Call() | lowering.IndirectCall():
-        for k in [
-          k for k, v in env.items()
-          if not (k.temp and (not isinstance(v, lowering.Place) or v.temp))
-        ]:
-          del env[k]
-        out.append(inst)
+      case lowering.Call(callee=callee, args=args, rets=rets):
+        args = tuple(sub(a) for a in args)
+        invalidate_for_call()
+        for r in rets:
+          if r is not None:
+            kill(r)
+        out.append(lowering.Call(callee, args, rets))
 
-      case lowering.SetZero():
-        raise NotImplementedError
+      case lowering.IndirectCall():
+        invalidate_for_call()
+        out.append(inst)
 
   block.body = out
 
@@ -127,8 +134,11 @@ def local_opt(block: lowering.BasicBlock) -> None:
       elif isinstance(c, lowering.IntImm):
         block.term = lowering.Jump(t if c.val else e)
       else:
-        assert isinstance(c, lowering.Place)
+        assert isinstance(c, lowering.Var)
         block.term = lowering.Branch(c, t, e)
+
+    case lowering.Ret(values=values):
+      block.term = lowering.Ret(tuple(sub(v) for v in values))
 
     case _:
       pass
@@ -145,6 +155,8 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
           case lowering.BinOp(lhs=l, rhs=r):
             used.add(l)
             used.add(r)
+          case lowering.Call(args=args):
+            used.update(args)
           case lowering.IndirectCall(target=t):
             used.add(t)
           case _:
@@ -155,6 +167,8 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
           used.add(c)
         case lowering.Jump(target=t) | lowering.IndirectJump(target=t):
           used.add(t)
+        case lowering.Ret(values=values):
+          used.update(values)
         case _:
           pass
 
@@ -167,6 +181,14 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
             lowering.Copy(dst=d) | lowering.BinOp(dst=d)
           ) if d.temp and d not in used:
             changed = True
+          case lowering.Call(callee=callee, args=args, rets=rets):
+            new_rets: list[lowering.Var | None] = []
+            for r in rets:
+              if r is not None and r.temp and r not in used:
+                changed = True
+                r = None
+              new_rets.append(r)
+            keep.append(lowering.Call(callee, args, tuple(new_rets)))
           case _:
             keep.append(inst)
       b.body = keep

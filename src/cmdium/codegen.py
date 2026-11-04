@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -40,13 +41,6 @@ class ScoreGet:
 
 class NBTContainer:
   ...
-
-
-def get_nbtpath(place: lowering.Place):
-  return ".".join(
-    seg if seg.isidentifier() or seg[0].isdigit() else json.dumps(seg)
-    for seg in (place.root, *place.fields)
-  )
 
 
 @dataclass(frozen=True)
@@ -431,6 +425,50 @@ def _classify(bop: lowering.BinaryOp) -> ScoreOp | CompareOp:
     case lowering.BinaryOp.CGE: return CompareOp.CGE
 
 
+class Names:
+  def __init__(self, objective: str, stg: Storage):
+    self.objective = objective
+    self.stg = stg
+    self.counts: dict[str, int] = {}
+    self.vars: dict[lowering.Var, CommandVar] = {}
+    self.rets: dict[tuple[lowering.IRFunc, int], CommandVar] = {}
+
+  def unique(self, hint: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.+\-]", "_", hint)
+    n = self.counts.get(base, 0)
+    self.counts[base] = n + 1
+    return f"{base}.{n}"
+
+  def make(
+    self, type: lowering.ScalarType, hint: str, temp: bool
+  ) -> CommandVar:
+    name = self.unique(hint)
+    match type:
+      case lowering.ScalarType.INT:
+        prefix = "#" if temp else "$"
+        return ScoreVar(prefix + name, self.objective)
+
+      case (
+        lowering.ScalarType.LABEL |
+        lowering.ScalarType.STR |
+        lowering.ScalarType.FUNC
+      ):
+        path = name if name.isidentifier() else json.dumps(name)
+        return self.stg.get_nbtvar(path)
+
+  def get(self, var: lowering.Var) -> CommandVar:
+    if var not in self.vars:
+      self.vars[var] = self.make(var.type, var.hint, var.temp)
+    return self.vars[var]
+
+  def get_ret(self, func: lowering.IRFunc, i: int) -> CommandVar:
+    if (func, i) not in self.rets:
+      self.rets[func, i] = self.make(
+        func.ret_types[i], f"{func.name}.ret{i}", False
+      )
+    return self.rets[func, i]
+
+
 class MCFuncBuilder:
   def __init__(
     self,
@@ -443,6 +481,7 @@ class MCFuncBuilder:
     objective: str,
     setup_func: str,
     consts: set[int],
+    names: Names,
   ):
     self.ns = ns
     self.stg = stg
@@ -450,6 +489,7 @@ class MCFuncBuilder:
     self.binop_tmp = binop_tmp
     self.comp_tmp = comp_tmp
     self.consts = consts
+    self.names = names
     self.objective = objective
     self.setup_func = setup_func
 
@@ -468,18 +508,8 @@ class MCFuncBuilder:
     self.add_const(const)
     return ScoreVar(str(const), self.objective)
 
-  def score_holder(
-    self, place: lowering.Place | lowering.IntImm
-  ) -> ScoreVar:
-    if isinstance(place, lowering.IntImm):
-      return self.const_holder(int(place.val))
-    
-    if place.temp:
-      return ScoreVar(f"#{place.path}", self.objective)
-    return ScoreVar(f"${place.path}", self.objective)
-
   @overload
-  def get_cmdop(self, op: lowering.Place) -> CommandVar:
+  def get_cmdop(self, op: lowering.Var) -> CommandVar:
     ...
 
   @overload
@@ -488,17 +518,8 @@ class MCFuncBuilder:
 
   def get_cmdop(self, op: lowering.Operand) -> CommandOp:
     match op:
-      case lowering.Place():
-        match op.layout_type:
-          case lowering.ScalarType.INT:
-            return self.score_holder(op)
-
-          case (
-            lowering.ScalarType.LABEL |
-            lowering.ScalarType.STR |
-            lowering.ScalarType.FUNC
-          ):
-            return self.stg.get_nbtvar(get_nbtpath(op))
+      case lowering.Var():
+        return self.names.get(op)
 
       case lowering.IntImm(val=val):
         return ScoreImm(int(val))
@@ -636,15 +657,6 @@ class MCFuncBuilder:
       case NBTVar():
         raise NotImplementedError  # ensured by semantic pass
 
-
-  def emit_setzero(self, dst: CommandVar):
-    match dst:
-      case ScoreVar():
-        self.emit(Scoreboard(dst, ScoreOp.SET, ScoreImm(0)))
-
-      case NBTVar():
-        self.emit(DataModify(dst, NBTImm("0")))
-
   def emit_call(self, func: CommandOp):
     match func:
       case ScoreVar():
@@ -687,6 +699,7 @@ class DatapackGen:
     self.objective = ns
     self.setup_func = ".setup"
     self.consts: set[int] = set()
+    self.names = Names(self.objective, self.stg)
 
     self.funcs: dict[str, MCFunction] = {}
     self.fb: MCFuncBuilder = None  # type: ignore
@@ -704,6 +717,7 @@ class DatapackGen:
       self.objective,
       self.setup_func,
       self.consts,
+      self.names,
     )
     try:
       yield self.fb
@@ -724,9 +738,6 @@ class DatapackGen:
 
   def gen(self) -> dict[str, MCFunction]:
     for func in self.ir_funcs:
-      for block in func.blocks:
-        block.scalarize()
-
       optimize.optimize(func)
       for block in func.blocks:
         block_name = block.name
@@ -735,7 +746,7 @@ class DatapackGen:
             self.gen_inst(inst)
 
           if block.term is not None:
-            self.gen_term(block.term)
+            self.gen_term(func, block.term)
 
     self.write_setup()
     return self.funcs
@@ -747,10 +758,6 @@ class DatapackGen:
         src = self.fb.get_cmdop(s)
         self.fb.emit_copy(dst, src)
 
-      case lowering.SetZero(dst=d):
-        dst = self.fb.get_cmdop(d)
-        self.fb.emit_setzero(dst)
-
       case lowering.BinOp(dst=d, lhs=l, rhs=r, bop=bop):
         dst = self.fb.get_cmdop(d)
         lhs = self.fb.get_cmdop(l)
@@ -759,15 +766,27 @@ class DatapackGen:
         assert isinstance(dst, CommandVar)
         self.fb.emit_binop(dst, lhs, bop, rhs)
 
-      case lowering.Call(callee=callee):
+      case lowering.Call(callee=callee, args=args, rets=rets):
+        func = callee.func
+        for param, arg in zip(func.params, args, strict=True):
+          self.fb.emit_copy(
+            self.fb.get_cmdop(param), self.fb.get_cmdop(arg)
+          )
+
         mcf = self.fb.get_cmdop(callee)
         self.fb.emit_call(mcf)
-      
+
+        for i, ret in enumerate(rets):
+          if ret is not None:
+            self.fb.emit_copy(
+              self.fb.get_cmdop(ret), self.names.get_ret(func, i)
+            )
+
       case lowering.IndirectCall(target=target):
         mcf = self.fb.get_cmdop(target)
         self.fb.emit_call(mcf)
 
-  def gen_term(self, term: lowering.Terminator):
+  def gen_term(self, func: lowering.IRFunc, term: lowering.Terminator):
     match term:
       case lowering.Jump(target=target):
         mcf = self.fb.get_cmdop(target)
@@ -784,12 +803,9 @@ class DatapackGen:
         mcf = self.fb.get_cmdop(target)
         self.fb.emit_jump(mcf, None)
 
-      case lowering.Ret():
+      case lowering.Ret(values=values):
+        for i, v in enumerate(values):
+          self.fb.emit_copy(
+            self.names.get_ret(func, i), self.fb.get_cmdop(v)
+          )
         self.fb.emit(ReturnVal(0))
-
-
-  def gen_setzero(self, inst: lowering.SetZero):
-    match inst.dst:
-      case lowering.Place() as dst:
-        holder = self.fb.score_holder(dst)
-        self.fb.emit_setzero(holder)

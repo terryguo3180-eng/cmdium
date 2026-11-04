@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import argparse
 import re
 import sys
 import warnings
+
+from pathlib import Path
 
 from cmdium import datapack
 from cmdium import error
@@ -69,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
   pack.add_argument(
     "-d", "--description", default="", metavar="TEXT",
     help="description in pack.mcmeta (default: empty)",
+  )
+  pack.add_argument(
+    "--entry", default=".main", metavar="NAME",
+    help="name of entry function (default: '.main')",
   )
   pack.add_argument(
     "--legacy-names", action=argparse.BooleanOptionalAction, default=None,
@@ -141,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
   # lowering
-  ir_funcs = lowering.Lowering(tree).lower()
+  ir_funcs = lowering.Lowering(tree, args.entry).lower()
   if args.emit == "ir":
     print("\n\n".join(str(f) for f in ir_funcs))
     return 0
@@ -166,8 +170,7 @@ def main(argv: list[str] | None = None) -> int:
   load = (".setup",)
 
   if args.autorun:
-    # TODO: kind of a hacky way, fix this later
-    load += (ir_funcs[0].entry.name,)
+    load += (args.entry,)
 
   try:
     result = datapack.write_datapack(

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import auto
-from typing import cast
 
 from cmdium import semantic
 from cmdium import syntax
@@ -57,40 +56,15 @@ def layout_of(type: semantic.TypeInfo) -> Layout:
       raise NotImplementedError("function values have no layout yet")
 
 
-@dataclass(frozen=True)
-class Place:
-  root: str
-  fields: tuple[str, ...]
-  layout: Layout
+@dataclass(eq=False)
+class Var:
+  type: ScalarType
+  hint: str
+  id: int
   temp: bool = False
 
-  @property
-  def path(self) -> str:
-    return ".".join((self.root, *self.fields))
-
-  def project(self, name: str) -> Place:
-    assert isinstance(self.layout, Aggregate)
-    for n, lay in self.layout.fields:
-      if n == name:
-        return Place(self.root, (*self.fields, name), lay, self.temp)
-    raise RuntimeError(f"unknown field: {name!r}")
-
-  def leaves(self) -> Iterator[Place]:
-    match self.layout:
-      case Aggregate(fields=fields):
-        for name, _ in fields:
-          yield from self.project(name).leaves()
-
-      case Scalar():
-        yield self
-
-  @property
-  def layout_type(self) -> ScalarType:
-    assert isinstance(self.layout, Scalar)
-    return self.layout.type
-
   def __str__(self):
-    return self.path
+    return f"%{self.hint}.{self.id}"
 
 
 @dataclass(frozen=True)
@@ -98,8 +72,8 @@ class IntImm:
   val: int
 
   @property
-  def layout(self) -> Layout:
-    return Scalar(ScalarType.INT)
+  def type(self) -> ScalarType:
+    return ScalarType.INT
 
   def __str__(self):
     return str(self.val)
@@ -110,8 +84,8 @@ class LabelImm:
   bb: BasicBlock
 
   @property
-  def layout(self) -> Layout:
-    return Scalar(ScalarType.LABEL)
+  def type(self) -> ScalarType:
+    return ScalarType.LABEL
 
   def __str__(self):
     return self.bb.name
@@ -122,8 +96,8 @@ class FuncImm:
   func: IRFunc
 
   @property
-  def layout(self) -> Layout:
-    return Scalar(ScalarType.FUNC)
+  def type(self) -> ScalarType:
+    return ScalarType.FUNC
 
   def __str__(self):
     return self.func.name
@@ -134,66 +108,45 @@ class StrImm:
   val: str
 
   @property
-  def layout(self) -> Layout:
-    return Scalar(ScalarType.STR)
+  def type(self) -> ScalarType:
+    return ScalarType.STR
 
   def __str__(self):
     return json.dumps(self.val, ensure_ascii=False)
 
 
 ImmValue = IntImm | LabelImm | FuncImm | StrImm
-Operand = Place | ImmValue
-
-
-class IRBase:
-  def emit_leaves(self) -> Iterator[IR]:
-    yield cast(IR, self)
+Operand = Var | ImmValue
 
 
 @dataclass
-class Copy(IRBase):
-  dst: Place
+class Copy:
+  dst: Var
   src: Operand
 
-  def emit_leaves(self) -> Iterator[IR]:
-    assert self.dst.layout == self.src.layout, (
-      f"layout mismatch: {self.dst.layout!r} vs {self.src.layout!r}"
+  def __post_init__(self):
+    assert self.dst.type == self.src.type, (
+      f"type mismatch: {self.dst.type!r} vs {self.src.type!r}"
     )
-
-    match self.src:
-      case Place():
-        for d, s in zip(self.dst.leaves(), self.src.leaves()):
-          yield Copy(d, s)
-
-      case IntImm() | LabelImm() | FuncImm() | StrImm():
-        yield self
 
   def __str__(self):
     return f"{self.dst!s} = {self.src!s}"
 
 
-@dataclass
-class SetZero(IRBase):
-  dst: Place
+def zero_of(type: ScalarType) -> ImmValue:
+  match type:
+    case ScalarType.INT:
+      return IntImm(0)
 
-  def emit_leaves(self) -> Iterator[IR]:
-    for leaf in self.dst.leaves():
-      assert isinstance(leaf.layout, Scalar)
-      match leaf.layout_type:
-        case ScalarType.INT:
-          yield Copy(leaf, IntImm(0))
-        case ScalarType.LABEL:
-          # '-.-', never used but valid
-          yield Copy(leaf, LabelImm(BasicBlock("-.-", [])))
-        case ScalarType.FUNC:
-          yield Copy(leaf, FuncImm(
-            IRFunc("-.-", [], Place(".", (), Aggregate(())), [])
-          ))
-        case ScalarType.STR:
-          yield Copy(leaf, StrImm(""))
+    case ScalarType.LABEL:
+      # '-.-', never used but valid
+      return LabelImm(BasicBlock("-.-", []))
 
-  def __str__(self):
-    return f"zero {self.dst!s}"
+    case ScalarType.FUNC:
+      return FuncImm(IRFunc("-.-", [], [], []))
+
+    case ScalarType.STR:
+      return StrImm("")
 
 
 class BinaryOp(utils.DataEnum):
@@ -232,8 +185,8 @@ def binaryop_of(binop: syntax.BinaryOp) -> BinaryOp:
 
 
 @dataclass
-class BinOp(IRBase):
-  dst: Place
+class BinOp:
+  dst: Var
   lhs: Operand
   bop: BinaryOp
   rhs: Operand
@@ -255,11 +208,11 @@ class Jump:
 
 @dataclass
 class IndirectJump:
-  target: Place  # LABEL
+  target: Var  # LABEL
   possible: tuple[BasicBlock, ...]
 
   def __post_init__(self):
-    assert self.target.layout == Scalar(ScalarType.LABEL)
+    assert self.target.type == ScalarType.LABEL
 
   def successors(self) -> Iterator[BasicBlock]:
     yield from self.possible
@@ -270,12 +223,12 @@ class IndirectJump:
 
 @dataclass
 class Branch:
-  cond: Place
+  cond: Var
   then: LabelImm
   orelse: LabelImm
 
   def __post_init__(self):
-    assert self.cond.layout == Scalar(ScalarType.INT)
+    assert self.cond.type == ScalarType.INT
 
   def successors(self) -> Iterator[BasicBlock]:
     yield self.then.bb
@@ -287,11 +240,15 @@ class Branch:
 
 @dataclass
 class Ret:
+  values: tuple[Operand, ...] = ()
+
   def successors(self) -> Iterator[BasicBlock]:
     return; yield
 
   def __str__(self):
-    return f"ret"
+    if not self.values:
+      return "ret"
+    return "ret " + ", ".join(str(v) for v in self.values)
 
 
 @dataclass(eq=False)
@@ -302,9 +259,6 @@ class BasicBlock:
 
   def emit(self, inst: IR):
     self.body.append(inst)
-
-  def scalarize(self):
-    self.body = [leaf for inst in self.body for leaf in inst.emit_leaves()]
 
   def __str__(self):
     s = f"{self.name}:\n"
@@ -318,8 +272,8 @@ class BasicBlock:
 @dataclass(eq=False)
 class IRFunc:
   name: str
-  params: list[Place]
-  ret: Place
+  params: list[Var]
+  ret_types: list[ScalarType]
   blocks: list[BasicBlock]
 
   @property
@@ -327,7 +281,8 @@ class IRFunc:
     return self.blocks[0]
 
   def __str__(self):
-    s = f"func {self.name} {{\n"
+    params = ", ".join(str(p) for p in self.params)
+    s = f"func {self.name}({params}) {{\n"
     for inst in self.blocks:
       for line in str(inst).split("\n"):
         s += "  " + str(line) + "\n"
@@ -336,46 +291,112 @@ class IRFunc:
 
 
 @dataclass
-class Call(IRBase):
+class Call:
   callee: FuncImm
+  args: tuple[Operand, ...]
+  rets: tuple[Var | None, ...]  # None: result is unused
 
   def __str__(self):
-    return f"call {self.callee!s}"
+    args = ", ".join(str(a) for a in self.args)
+    call = f"call {self.callee!s}({args})"
+    if all(r is None for r in self.rets):
+      return call
+
+    rets = ", ".join("_" if r is None else str(r) for r in self.rets)
+    return f"{rets} = {call}"
 
 
 @dataclass
-class IndirectCall(IRBase):
-  target: Place  # LABEL
+class IndirectCall:
+  target: Var  # LABEL
   possible: tuple[IRFunc, ...]
 
 
-IR = Copy | SetZero | BinOp | Call | IndirectCall
+IR = Copy | BinOp | Call | IndirectCall
 Terminator = Jump | IndirectJump | Branch | Ret
+
+
+@dataclass(frozen=True)
+class Agg:
+  fields: tuple[tuple[str, Val], ...]
+
+  def get(self, name: str) -> Val:
+    for n, v in self.fields:
+      if n == name:
+        return v
+    raise RuntimeError(f"unknown field: {name!r}")
+
+
+# lowering-time value, IR itself only sees the scalar leaves
+Val = Operand | Agg
+
+
+def build(
+  layout: Layout,
+  leaf: Callable[[str, ScalarType], Operand],
+  path: str = "",
+) -> Val:
+  match layout:
+    case Aggregate(fields=fields):
+      return Agg(tuple(
+        (name, build(lay, leaf, f"{path}.{name}")) for name, lay in fields
+      ))
+
+    case Scalar(type=type):
+      return leaf(path, type)
+
+
+def leaves(val: Val) -> Iterator[Operand]:
+  match val:
+    case Agg(fields=fields):
+      for _, v in fields:
+        yield from leaves(v)
+
+    case _:
+      yield val
+
+
+def leaf_types(layout: Layout) -> list[ScalarType]:
+  match layout:
+    case Aggregate(fields=fields):
+      types: list[ScalarType] = []
+      for _, lay in fields:
+        types.extend(leaf_types(lay))
+      return types
+
+    case Scalar(type=type):
+      return [type]
+
+
+def zero_val(layout: Layout) -> Val:
+  return build(layout, lambda _, type: zero_of(type))
 
 
 class FuncBuilder:
   def __init__(self, name: str, ret_layout: Layout):
     self.name = name
-    self.ret = Place(f"{name}.ret", (), ret_layout)
-    self.params: list[Place] = []
+    self.ret_layout = ret_layout
+    self.params: list[Var] = []
     self.blocks: list[BasicBlock] = []
-    self.func = IRFunc(name, self.params, self.ret, self.blocks)
+    self.func = IRFunc(name, self.params, leaf_types(ret_layout), self.blocks)
 
     self.break_stack: list[BasicBlock] = []
     self.continue_stack: list[BasicBlock] = []
 
     self.n_blocks = 0
-    self.n_slots = 0
+    self.n_vars = 0
     self.cur = self.start(self.new_block("entry"))
 
   def new_block(self, hint: str) -> BasicBlock:
     self.n_blocks += 1
     return BasicBlock(f"{self.name}/{hint}{self.n_blocks}", [])
 
-  def param(self, name: str, layout: Layout) -> Place:
-    p = self.var(name, layout)
-    self.params.append(p)
-    return p
+  def param(self, name: str, layout: Layout) -> Val:
+    val = self.fresh(layout, name)
+    for leaf in leaves(val):
+      assert isinstance(leaf, Var)
+      self.params.append(leaf)
+    return val
 
   def start(self, block: BasicBlock) -> BasicBlock:
     assert not self.blocks or self.cur.term is not None
@@ -386,16 +407,6 @@ class FuncBuilder:
   @property
   def open(self) -> bool:
     return self.cur.term is None
-
-  def as_place(self, op: Operand) -> Place:
-    match op:
-      case Place():
-        return op
-      
-      case IntImm() | LabelImm() | FuncImm() | StrImm():
-        tmp = self.temp(op.layout)
-        self.emit(Copy(tmp, op))
-        return tmp
 
   def emit(self, inst: IR):
     assert self.open
@@ -417,10 +428,8 @@ class FuncBuilder:
       case LabelImm() | FuncImm() | StrImm():
         raise NotImplementedError
 
-      case _:
-        self.set_term(
-          Branch(self.as_place(cond), LabelImm(then), LabelImm(orelse))
-        )
+      case Var():
+        self.set_term(Branch(cond, LabelImm(then), LabelImm(orelse)))
 
   @contextmanager
   def push_loop(self, break_b: BasicBlock, continue_b: BasicBlock):
@@ -438,13 +447,30 @@ class FuncBuilder:
   def continue_block(self):
     return self.continue_stack[-1]
 
-  def var(self, name: str, layout: Layout) -> Place:
-    self.n_slots += 1
-    return Place(f"{self.name}.{name}{self.n_slots}", (), layout)
+  def new_var(self, type: ScalarType, hint: str, temp: bool = False) -> Var:
+    self.n_vars += 1
+    return Var(type, hint, self.n_vars, temp)
 
-  def temp(self, layout: Layout) -> Place:
-    self.n_slots += 1
-    return Place(f"{self.name}.t{self.n_slots}", (), layout, temp=True)
+  def temp(self, type: ScalarType) -> Var:
+    return self.new_var(type, "t", temp=True)
+
+  def fresh(self, layout: Layout, hint: str, temp: bool = False) -> Val:
+    return build(
+      layout, lambda path, type: self.new_var(type, hint + path, temp)
+    )
+
+  def copy_into(self, dst: Val, src: Val):
+    match dst, src:
+      case Agg(fields=dfields), Agg(fields=sfields):
+        assert [n for n, _ in dfields] == [n for n, _ in sfields]
+        for (_, d), (_, s) in zip(dfields, sfields):
+          self.copy_into(d, s)
+
+      case Var(), Var() | IntImm() | LabelImm() | FuncImm() | StrImm():
+        self.emit(Copy(dst, src))
+
+      case _:
+        raise RuntimeError("value shape mismatch")
 
   def _check_cfg(self):
     ids = {id(b) for b in self.func.blocks}
@@ -454,20 +480,26 @@ class FuncBuilder:
         assert id(s) in ids, \
           f"{b.name!s} -> {s!s}: successor block not inside current func"
 
+      if isinstance(b.term, Ret):
+        types = [v.type for v in b.term.values]
+        assert types == self.func.ret_types, (
+          f"{b.name}: returns {types!r}, expected {self.func.ret_types!r}"
+        )
+
   def finish(self) -> IRFunc:
     if self.open:
-      self.set_term(Ret())
+      self.set_term(Ret(tuple(leaves(zero_val(self.ret_layout)))))
     self._check_cfg()
     return self.func
 
 
 class Lowering:
-  def __init__(self, tree: syntax.CompilationUnit):
+  def __init__(self, tree: syntax.CompilationUnit, entry_name: str):
     self.tree = tree
-    self.fb = FuncBuilder(".main", Scalar(ScalarType.INT))
+    self.fb = FuncBuilder(entry_name, Aggregate(()))
     self.funcs: dict[semantic.Symbol, IRFunc] = {}
     self.builders: dict[semantic.Symbol, FuncBuilder] = {}
-    self.sym_places: dict[semantic.Symbol, Place] = {}
+    self.sym_vals: dict[semantic.Symbol, Val] = {}
 
   def declare_func(self, node: syntax.FuncDecl):
     fty = node.sym.type
@@ -475,7 +507,7 @@ class Lowering:
     fb = FuncBuilder(node.name, layout_of(fty.ret_type))
     
     for p in node.params:
-      self.sym_places[p.sym] = fb.param(p.name, layout_of(p.sym.type))
+      self.sym_vals[p.sym] = fb.param(p.name, layout_of(p.sym.type))
   
     self.funcs[node.sym] = fb.func
     self.builders[node.sym] = fb
@@ -502,29 +534,33 @@ class Lowering:
         self.fb = prev
 
       case syntax.VarDecl(name=name, init=init, sym=sym):
-        if init is not None:
+        layout = layout_of(sym.type)
+        if init is None:
+          ival = zero_val(layout)
+        else:
           ival = self.lower_expr(init)
 
-        dst = self.fb.var(name, layout_of(sym.type))
-        self.sym_places[sym] = dst
-
-        if init is None:
-          self.fb.emit(SetZero(dst))
-        else:
-          self.fb.emit(Copy(dst, ival))  # type: ignore
+        dst = self.fb.fresh(layout, name)
+        self.sym_vals[sym] = dst
+        self.fb.copy_into(dst, ival)
 
       case syntax.Assign(dst=dst, val=val):
         dst_v = self.lower_expr(dst)
         val_v = self.lower_expr(val)
 
-        assert isinstance(dst_v, Place)
-        self.fb.emit(Copy(dst_v, val_v))
+        # the elements may read dst, e.g. `t = (t.1, t.0);`
+        if isinstance(val, (syntax.TupleLiteral, syntax.StructLiteral)):
+          tmp = self.fb.fresh(layout_of(val.type), "t", temp=True)
+          self.fb.copy_into(tmp, val_v)
+          val_v = tmp
+
+        self.fb.copy_into(dst_v, val_v)
 
       case syntax.AugAssign(dst=dst, val=val, bop=bop_node):
-        dst_v = self.lower_expr(dst)
-        val_v = self.lower_expr(val)
+        dst_v = self.lower_scalar(dst)
+        val_v = self.lower_scalar(val)
 
-        assert isinstance(dst_v, Place)
+        assert isinstance(dst_v, Var)
         self.fb.emit(BinOp(dst_v, dst_v, binaryop_of(bop_node.bop), val_v))
 
       case syntax.ExprStmt(val=val):
@@ -539,7 +575,7 @@ class Lowering:
           self.lower_stmt(stmt)
 
       case syntax.If(test=test, body=body, orelse=orelse):
-        cond = self.lower_expr(test)
+        cond = self.lower_scalar(test)
         then_b = self.fb.new_block("then")
         end_b = self.fb.new_block("end")
         else_b = self.fb.new_block("else") if orelse is not None else end_b
@@ -565,7 +601,7 @@ class Lowering:
         if test is None:
           self.fb.goto(body_b)
         else:
-          self.fb.branch(self.lower_expr(test), body_b, end_b)
+          self.fb.branch(self.lower_scalar(test), body_b, end_b)
 
         with self.fb.push_loop(end_b, head_b):
           self.fb.start(body_b)
@@ -584,9 +620,10 @@ class Lowering:
 
       case syntax.Return(val=val):
         if val is not None:
-          v = self.lower_expr(val)
-          self.fb.emit(Copy(self.fb.ret, v))
-        self.fb.set_term(Ret())
+          values = tuple(leaves(self.lower_expr(val)))
+        else:
+          values = ()
+        self.fb.set_term(Ret(values))
         self.fb.start(self.fb.new_block("dead"))
 
       case syntax.Pass():
@@ -595,19 +632,24 @@ class Lowering:
       case syntax.TypeDecl() | syntax.StructDecl():
         pass
 
-  def lower_expr(self, node: syntax.Expression) -> Operand:
+  def lower_scalar(self, node: syntax.Expression) -> Operand:
+    val = self.lower_expr(node)
+    assert not isinstance(val, Agg)
+    return val
+
+  def lower_expr(self, node: syntax.Expression) -> Val:
     match node:
       case syntax.BinaryExpr(lhs=lhs, rhs=rhs, bop=bop_node):
-        dst_v = self.fb.temp(layout_of(node.type))
-        lhs_v = self.lower_expr(lhs)
-        rhs_v = self.lower_expr(rhs)
+        dst_v = self.fb.temp(ScalarType.INT)
+        lhs_v = self.lower_scalar(lhs)
+        rhs_v = self.lower_scalar(rhs)
         self.fb.emit(BinOp(dst_v, lhs_v, binaryop_of(bop_node.bop), rhs_v))
 
         return dst_v
 
       case syntax.UnaryExpr(val=val, uop=uop_node):
-        v = self.lower_expr(val)
-        dst = self.fb.temp(layout_of(node.type))
+        v = self.lower_scalar(val)
+        dst = self.fb.temp(ScalarType.INT)
         zero = IntImm(0)
 
         match uop_node.uop:
@@ -623,15 +665,15 @@ class Lowering:
           raise NotImplementedError("indirect call not supported yet")
         callee = self.funcs[src.sym]
 
-        vals = [self.lower_expr(a) for a in args]
-        for param, v in zip(callee.params, vals):
-          self.fb.emit(Copy(param, v))
+        call_args: list[Operand] = []
+        for a in args:
+          call_args.extend(leaves(self.lower_expr(a)))
 
-        self.fb.emit(Call(FuncImm(callee)))
+        rets = [self.fb.temp(t) for t in callee.ret_types]
+        self.fb.emit(Call(FuncImm(callee), tuple(call_args), tuple(rets)))
 
-        res = self.fb.temp(callee.ret.layout)
-        self.fb.emit(Copy(res, callee.ret))
-        return res
+        it = iter(rets)
+        return build(layout_of(node.type), lambda _, __: next(it))
 
       case syntax.Name() | syntax.MemberAccess():
         return self.lower_lval(node)
@@ -653,27 +695,22 @@ class Lowering:
             raise NotImplementedError
 
       case syntax.TupleLiteral(elems=elems):
-        vals = [self.lower_expr(e) for e in elems]
-        dst = self.fb.temp(layout_of(node.type))
-        for i, v in enumerate(vals):
-          self.fb.emit(Copy(dst.project(str(i)), v))
-        return dst
+        return Agg(tuple(
+          (str(i), self.lower_expr(e)) for i, e in enumerate(elems)
+        ))
 
       case syntax.StructLiteral(fields=fields):
         vals = {f.name: self.lower_expr(f.val) for f in fields}
-        dst = self.fb.temp(layout_of(node.type))
-        assert isinstance(dst.layout, Aggregate)
-        for fname, _ in dst.layout.fields:
-          self.fb.emit(Copy(dst.project(fname), vals[fname]))
-        return dst
+        layout = layout_of(node.type)
+        assert isinstance(layout, Aggregate)
+        return Agg(tuple((name, vals[name]) for name, _ in layout.fields))
 
-
-  def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Place:
+  def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Val:
     match node:
       case syntax.Name(sym=sym):
-        return self.sym_places[sym]
+        return self.sym_vals[sym]
 
       case syntax.MemberAccess(src=src, att=att):
         src_v = self.lower_expr(src)
-        assert isinstance(src_v, Place)
-        return src_v.project(att)
+        assert isinstance(src_v, Agg)
+        return src_v.get(att)
