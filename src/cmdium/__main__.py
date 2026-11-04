@@ -1,52 +1,204 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import argparse
+import re
+import sys
 import warnings
 
-from cmdium import syntax
+from cmdium import datapack
 from cmdium import error
-from cmdium.codegen import DatapackGen
-from cmdium.lowering import Lowering
-from cmdium.semantic import Semantic
+from cmdium import syntax
+from cmdium import codegen
+from cmdium import lowering
+from cmdium import semantic
 
 
-file = "../demos/test.cmdium"
+# pack_format 48 = Minecraft 1.21 (the first version using `function/`
+# instead of `functions/` in data packs).
+DEFAULT_PACK_FORMAT = 48
+FIRST_SINGULAR_PACK_FORMAT = 48
 
-with open(file, encoding="utf-8") as f:
-  src = f.read()
+EMIT_STAGES = ("ast", "ir", "mcfunction", "pack")
 
-print("---")
-print(src)
-print("---")
-print()
 
-try:
-  with warnings.catch_warnings(record=True) as warns:
-    tree = syntax.parse(src, file)
-    print(tree)
-    typed = Semantic(tree, file).analyze()
+def default_namespace(path: Path) -> str:
+  ns = re.sub(r"[^a-z0-9_.\-]", "_", path.stem.lower())
+  return ns or "custom"
 
-  for warn in warns:
-    if isinstance(warn.message, error.CompileWarning):
-      print(error.format_error(warn.message, True))
 
-except error.CompileError as err:
-  print(error.format_error(err, True))
-  exit(1)
+def build_parser() -> argparse.ArgumentParser:
+  p = argparse.ArgumentParser(
+    prog="cmdium",
+    description="Compile a .cmdium source file into a Minecraft data pack.",
+  )
+  p.add_argument("input", type=Path, help="source file to compile")
 
-else:
-    ir_funcs = Lowering(tree).lower()
-    print("---")
-    for ir_func in ir_funcs:
-      print(str(ir_func))
+  out = p.add_argument_group("output")
+  out.add_argument(
+    "-o", "--output", type=Path, metavar="PATH",
+    help="output path; a '.zip' suffix produces a zip, anything else a "
+         "directory (default: ./<namespace>.zip)",
+  )
+  out.add_argument(
+    "--format", choices=("auto", "dir", "zip"), default="auto",
+    help="force the output format instead of guessing from --output "
+         "(default: auto)",
+  )
+  out.add_argument(
+    "--emit", choices=EMIT_STAGES, default="pack",
+    help="stop after a stage and print its result to stdout instead of "
+         "writing a data pack: ast, ir, mcfunction (default: pack)",
+  )
+  out.add_argument(
+    "--check", action="store_true",
+    help="only parse and type-check; write nothing (implies no output)",
+  )
+
+  pack = p.add_argument_group("data pack")
+  pack.add_argument(
+    "-n", "--namespace", metavar="NAME",
+    help="data pack namespace, only a-z 0-9 _ . - allowed "
+         "(default: derived from the input file name)",
+  )
+  pack.add_argument(
+    "--pack-format", type=int, default=DEFAULT_PACK_FORMAT, metavar="N",
+    help=f"pack_format in pack.mcmeta (default: {DEFAULT_PACK_FORMAT})",
+  )
+  pack.add_argument(
+    "-d", "--description", default="", metavar="TEXT",
+    help="description in pack.mcmeta (default: empty)",
+  )
+  pack.add_argument(
+    "--legacy-names", action=argparse.BooleanOptionalAction, default=None,
+    help="use 'functions/' instead of 'function/' directories "
+         f"(default: on when pack-format < {FIRST_SINGULAR_PACK_FORMAT})",
+  )
+  pack.add_argument(
+    "--autorun", action="store_true",
+    help="also run the program's entry function on world load, after .setup",
+  )
+
+  diag = p.add_argument_group("diagnostics")
+  diag.add_argument(
+    "-W", "--werror", action="store_true",
+    help="treat warnings as errors",
+  )
+  diag.add_argument(
+    "--color", choices=("auto", "always", "never"), default="auto",
+    help="colorize diagnostics (default: auto)",
+  )
+  diag.add_argument(
+    "-q", "--quiet", action="store_true",
+    help="don't print the 'wrote ...' summary",
+  )
+  return p
+
+
+def main(argv: list[str] | None = None) -> int:
+  args = build_parser().parse_args(argv)
+
+  if args.color == "always":
+    colored = True
+  elif args.color == "never":
+    colored = False
+  else:
+    colored = sys.stderr.isatty()
+
+  file: Path = args.input
+  try:
+    src = file.read_text(encoding="utf-8")
+  except OSError as e:
+    print(f"cmdium: cannot read {str(file)!r}: {e.strerror}", file=sys.stderr)
+    return 1
+
+  path = str(file)
+
+  # parse & semantic
+  try:
+    with warnings.catch_warnings(record=True) as warns:
+      warnings.simplefilter("always")
+      tree = syntax.parse(src, path)
+      if args.emit == "ast":
+        print(tree)
+      semantic.Semantic(tree, path).analyze()
+
+  except error.CompileError as err:
+    print(error.format_error(err, colored), file=sys.stderr)
+    return 1
+
+  n_warn = 0
+  for w in warns:
+    if isinstance(w.message, error.CompileWarning):
+      n_warn += 1
+      print(error.format_error(w.message, colored), file=sys.stderr)
+  if args.werror and n_warn:
+    print(f"cmdium: {n_warn} warning(s) treated as errors", file=sys.stderr)
+    return 1
+
+  if args.check or args.emit == "ast":
+    return 0
+
+  # lowering
+  ir_funcs = lowering.Lowering(tree).lower()
+  if args.emit == "ir":
+    print("\n\n".join(str(f) for f in ir_funcs))
+    return 0
+
+  # codegen
+  namespace = args.namespace or default_namespace(file)
+  mc_funcs = codegen.DatapackGen(ir_funcs, namespace).gen()
+
+  if args.emit == "mcfunction":
+    for name, fn in mc_funcs.items():
+      print(f"# {name}.mcfunction")
+      for cmd in fn.cmds:
+        print(f"  {cmd}")
       print()
-    print("---")
+    return 0
 
-    mc_funcs = DatapackGen(ir_funcs, "cmdium").gen()
+  # write the data pack
+  out: Path = args.output or Path(f"{namespace}.zip")
+  legacy = args.legacy_names
+  if legacy is None:
+    legacy = args.pack_format < FIRST_SINGULAR_PACK_FORMAT
+  load = (".setup",)
 
-    print("---")
-    for name, mc_func in mc_funcs.items():
-      print("# " + name + ".mcfunction")
+  if args.autorun:
+    # TODO: kind of a hacky way, fix this later
+    load += (ir_funcs[0].entry.name,)
 
-      for cmd in mc_func.cmds:
-        print("  " + str(cmd))
-      print()
-    print("---")
-    print()
+  try:
+    result = datapack.write_datapack(
+      mc_funcs, out,
+      namespace=namespace,
+      pack_format=args.pack_format,
+      description=args.description,
+      load=load,
+      legacy_names=legacy,
+      fmt=args.format,
+    )
+  except ValueError as e:
+    print(f"cmdium: error: {e}", file=sys.stderr)
+    return 1
+  except OSError as e:
+    print(f"cmdium: cannot write {str(out)!r}: {e.strerror}", file=sys.stderr)
+    return 1
+
+  if not args.quiet:
+    print(
+      f"wrote {result} ({len(mc_funcs)} functions, namespace {namespace!r})"
+    )
+  return 0
+
+
+if __name__ == "__main__":
+  try:
+    code = main()
+    sys.stdout.flush()
+  except BrokenPipeError:
+    import os
+    os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    code = 1
+  sys.exit(code)

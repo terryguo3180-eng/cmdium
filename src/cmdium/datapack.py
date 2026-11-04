@@ -11,21 +11,24 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
   from cmdium.codegen import MCFunction
 
-_NAMESPACE_RE = re.compile(r"[a-z0-9_.\-]+")
-_PATH_RE = re.compile(r"[a-z0-9_.\-/]+")
 
-
-def _check_namespace(namespace: str) -> None:
-  if not _NAMESPACE_RE.fullmatch(namespace):
+def build_files(
+  funcs: Mapping[str, MCFunction],
+  namespace: str,
+  pack_format: int,
+  description: str = "",
+  load: Sequence[str] = (".setup",),
+  legacy_names: bool = False,
+) -> dict[str, str]:
+  
+  if not re.fullmatch(r"[a-z0-9_.\-]+", namespace):
     raise ValueError(
       f"invalid namespace {namespace!r}: only a-z 0-9 _ . - are allowed"
     )
 
-
-def _check_function_names(names: Sequence[str]) -> None:
   bad = [
-    n for n in names
-    if not _PATH_RE.fullmatch(n)
+    n for n in funcs
+    if not re.fullmatch(re.compile(r"[a-z0-9_.\-/]+"), n)
     or any(seg in ("", ".", "..") for seg in n.split("/"))
   ]
   if bad:
@@ -36,23 +39,6 @@ def _check_function_names(names: Sequence[str]) -> None:
       "Only a-z 0-9 _ . - / are allowed (no uppercase, no empty or '..' "
       "path segments)."
     )
-
-
-def _function_text(fn: MCFunction) -> str:
-  return "".join(f"{cmd}\n" for cmd in fn.cmds)
-
-
-def build_files(
-  funcs: Mapping[str, MCFunction],
-  *,
-  namespace: str,
-  pack_format: int,
-  description: str = "",
-  load: Sequence[str] = (".setup",),
-  legacy_names: bool = False,
-) -> dict[str, str]:
-  _check_namespace(namespace)
-  _check_function_names(list(funcs))
 
   missing = [n for n in load if n not in funcs]
   if missing:
@@ -68,7 +54,9 @@ def build_files(
   }
 
   for name, fn in funcs.items():
-    files[f"data/{namespace}/{fdir}/{name}.mcfunction"] = _function_text(fn)
+    files[f"data/{namespace}/{fdir}/{name}.mcfunction"] = "".join(
+      f"{cmd}\n" for cmd in fn.cmds
+    )
 
   if load:
     files[f"data/minecraft/tags/{fdir}/load.json"] = json.dumps(
@@ -77,35 +65,9 @@ def build_files(
 
   return files
 
-
-def _write_dir(
-  files: Mapping[str, str], out: Path, namespace: str, legacy_names: bool,
-) -> None:
-  fdir = "functions" if legacy_names else "function"
-  stale = out / "data" / namespace / fdir
-  if stale.is_dir():
-    shutil.rmtree(stale)
-
-  for rel, text in files.items():
-    path = out / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(text.encode("utf-8"))
-
-
-def _write_zip(files: Mapping[str, str], out: Path) -> None:
-  out.parent.mkdir(parents=True, exist_ok=True)
-  with zipfile.ZipFile(out, "w") as zf:
-    for rel in sorted(files):
-      info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
-      info.compress_type = zipfile.ZIP_DEFLATED
-      info.external_attr = 0o644 << 16
-      zf.writestr(info, files[rel].encode("utf-8"))
-
-
 def write_datapack(
   funcs: Mapping[str, MCFunction],
   out: str | Path,
-  *,
   namespace: str,
   pack_format: int,
   description: str = "",
@@ -123,8 +85,23 @@ def write_datapack(
   )
 
   if fmt == "zip":
-    _write_zip(files, out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out, "w") as zf:
+      for rel in sorted(files):
+        # for reproducibility
+        info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = 0o644 << 16
+        zf.writestr(info, files[rel].encode("utf-8"))
   else:
-    _write_dir(files, out, namespace, legacy_names)
+    fdir = "functions" if legacy_names else "function"
+    stale = out / "data" / namespace / fdir
+    if stale.is_dir():
+      shutil.rmtree(stale)
+  
+    for rel, text in files.items():
+      path = out / rel
+      path.parent.mkdir(parents=True, exist_ok=True)
+      path.write_bytes(text.encode("utf-8"))
 
   return out
