@@ -531,6 +531,10 @@ class Lowering:
         self.lower_expr(val)
 
       case syntax.Block(body=body):
+        for s in body:
+          if isinstance(s, syntax.FuncDecl) and s.sym not in self.funcs:
+            self.declare_func(s)
+            
         for stmt in body:
           self.lower_stmt(stmt)
 

@@ -180,6 +180,8 @@ class Semantic:
     self.return_type: TypeInfo | None = None
 
   def analyze(self) -> syntax.CompilationUnit:
+    self.declare_items(self.tree.body)
+
     for stmt in self.tree.body:
       self.analyze_stmt(stmt)
 
@@ -207,6 +209,61 @@ class Semantic:
     finally:
       for key, val in prevs.items():
         setattr(self, key, val)
+
+  def declare_items(self, stmts: list[syntax.Statement]) -> None:
+    structs = [s for s in stmts if isinstance(s, syntax.StructDecl)]
+    aliases = [s for s in stmts if isinstance(s, syntax.TypeDecl)]
+    funcs = [s for s in stmts if isinstance(s, syntax.FuncDecl)]
+
+    shells: list[tuple[syntax.StructDecl, Struct]] = []
+    for s in structs:
+      ty = Struct(s.name, {})
+      self.scope.declare_type(s.name, ty, s.name_tok.span)
+      shells.append((s, ty))
+
+    for a in aliases:
+      self.scope.declare_type(
+        a.name, self.analyze_type(a.type), a.name_tok.span
+      )
+
+    for s, ty in shells:
+      for f in s.fields:
+        if f.name in ty.fields:
+          raise error.CompileError(f"duplicate field {f.name!r}", f.span)
+        ty.fields[f.name] = self.analyze_type(f.type)
+
+    for s, ty in shells:
+      if any(self._contains(ft, ty, set()) for ft in ty.fields.values()):
+        raise error.CompileError(
+          f"struct {s.name!r} contains itself and would have infinite size",
+          s.name_tok.span,
+        )
+
+    for fn in funcs:
+      if fn.ret_type is None:
+        ret = BuiltinTypes.void
+      else:
+        ret = self.analyze_type(fn.ret_type)
+      params = [self.analyze_type(p.type) for p in fn.params]
+      sym = Symbol(fn.name, Function(params, ret))
+      fn.set_symbol(sym)
+      self.scope.declare_name(fn.name, sym, fn.name_tok.span)
+
+  def _contains(self, ty: TypeInfo, target: Struct, seen: set[int]) -> bool:
+    match ty:
+      case Struct(fields=fields):
+        if ty is target:
+          return True
+        if id(ty) in seen:
+          return False
+        seen.add(id(ty))
+        return any(self._contains(f, target, seen) for f in fields.values())
+      
+      case Tuple(fields=fields):
+        return any(self._contains(f, target, seen) for f in fields)
+      
+      case _:
+        return False
 
   def analyze_stmt(self, node: syntax.Statement):
     match node:
@@ -257,6 +314,7 @@ class Semantic:
 
       case syntax.Block(body=body):
         with self.with_scope():
+          self.declare_items(body)
           for stmt in body:
             self.analyze_stmt(stmt)
 
@@ -268,52 +326,21 @@ class Semantic:
         if not self.inside_loop:
           raise error.CompileError("continue statement outside loop", span)
 
-      case syntax.TypeDecl(name_tok=name_tok):
-        self.scope.declare_type(
-          node.name, self.analyze_type(node.type), name_tok.span
-        )
-      
-      case syntax.StructDecl(
-        name=name, fields=fields, name_tok=name_tok,
-      ):
-        fields_map: dict[str, TypeInfo] = {}
-        for field in fields:
-          if field.name in fields_map:
-            raise error.CompileError(
-              f"duplicate field {field.name!r}", field.span
-            )
+      case syntax.StructDecl() | syntax.TypeDecl():
+        pass  # declared by declare_items
 
-          fields_map[field.name] = self.analyze_type(field.type)
-
-        ty = Struct(name, fields_map)
-        self.scope.declare_type(name, ty, name_tok.span)
-
-      case syntax.FuncDecl(
-        name=name, params=params, ret_type=ret_type, body=body,
-        name_tok=name_tok,
-      ):
-        if ret_type is None:
-          return_type = BuiltinTypes.void
-        else:
-          return_type = self.analyze_type(ret_type)
-
-        param_types: list[TypeInfo] = []
-        for p in params:
-          ty = self.analyze_type(p.type)
-          param_types.append(ty)
-
-        ty = Function(param_types, return_type)
-        sym = Symbol(name, ty)
-        node.set_symbol(sym)
-        self.scope.declare_name(name, sym, name_tok.span)
-        
+      case syntax.FuncDecl(params=params, body=body):
+        fty = node.sym.type  # set by declare_items
+        assert isinstance(fty, Function)
         with self.with_scope():
-          for p, pty in zip(params, param_types):
+          for p, pty in zip(params, fty.params):
             psym = Symbol(p.name, pty)
             p.set_symbol(psym)
             self.scope.declare_name(p.name, psym, p.span)
 
-          with self.with_state(return_type=return_type, inside_func=True):
+          with self.with_state(
+            return_type=fty.ret_type, inside_func=True, inside_loop=False
+          ):
             self.analyze_stmt(body)
 
       case syntax.ExprStmt(val=val):
