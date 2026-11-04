@@ -59,15 +59,20 @@ def layout_of(type: semantic.TypeInfo) -> Layout:
 
 @dataclass(frozen=True)
 class Place:
-  path: str
+  root: str
+  fields: tuple[str, ...]
   layout: Layout
   temp: bool = False
+
+  @property
+  def path(self) -> str:
+    return ".".join((self.root, *self.fields))
 
   def project(self, name: str) -> Place:
     assert isinstance(self.layout, Aggregate)
     for n, lay in self.layout.fields:
       if n == name:
-        return Place(f"{self.path}.{name}", lay, self.temp)
+        return Place(self.root, (*self.fields, name), lay, self.temp)
     raise RuntimeError(f"unknown field: {name!r}")
 
   def leaves(self) -> Iterator[Place]:
@@ -182,7 +187,7 @@ class SetZero(IRBase):
           yield Copy(leaf, LabelImm(BasicBlock("-.-", [])))
         case ScalarType.FUNC:
           yield Copy(leaf, FuncImm(
-            IRFunc("-.-", [], Place(".", Aggregate(())), [])
+            IRFunc("-.-", [], Place(".", (), Aggregate(())), [])
           ))
         case ScalarType.STR:
           yield Copy(leaf, StrImm(""))
@@ -351,7 +356,7 @@ Terminator = Jump | IndirectJump | Branch | Ret
 class FuncBuilder:
   def __init__(self, name: str, ret_layout: Layout):
     self.name = name
-    self.ret = Place(f"{name}.ret", ret_layout)
+    self.ret = Place(f"{name}.ret", (), ret_layout)
     self.params: list[Place] = []
     self.blocks: list[BasicBlock] = []
     self.func = IRFunc(name, self.params, self.ret, self.blocks)
@@ -435,11 +440,11 @@ class FuncBuilder:
 
   def var(self, name: str, layout: Layout) -> Place:
     self.n_slots += 1
-    return Place(f"{self.name}.{name}{self.n_slots}", layout)
+    return Place(f"{self.name}.{name}{self.n_slots}", (), layout)
 
   def temp(self, layout: Layout) -> Place:
     self.n_slots += 1
-    return Place(f"{self.name}.t{self.n_slots}", layout, temp=True)
+    return Place(f"{self.name}.t{self.n_slots}", (), layout, temp=True)
 
   def _check_cfg(self):
     ids = {id(b) for b in self.func.blocks}
@@ -642,6 +647,21 @@ class Lowering:
 
           case ScalarType.FUNC | ScalarType.LABEL:
             raise NotImplementedError
+
+      case syntax.TupleLiteral(elems=elems):
+        vals = [self.lower_expr(e) for e in elems]
+        dst = self.fb.temp(layout_of(node.type))
+        for i, v in enumerate(vals):
+          self.fb.emit(Copy(dst.project(str(i)), v))
+        return dst
+
+      case syntax.StructLiteral(fields=fields):
+        vals = {f.name: self.lower_expr(f.val) for f in fields}
+        dst = self.fb.temp(layout_of(node.type))
+        assert isinstance(dst.layout, Aggregate)
+        for fname, _ in dst.layout.fields:
+          self.fb.emit(Copy(dst.project(fname), vals[fname]))
+        return dst
 
 
   def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Place:

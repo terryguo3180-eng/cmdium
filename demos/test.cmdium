@@ -1,24 +1,56 @@
-func is_prime(n: i32) -> bool {
-  if (n < 2) return F;
-  if (n == 2 | n == 3) return T;
-  if (n % 2 == 0) return F;
+struct Vec { x: i32, y: i32 };
 
-  i: i32 = 3;
-  while (i <= n / i) {
-    if (n % i == 0) {
-      return F;
-    }
-    i += 2;
-  }
+struct Player {
+  name: str,
+  hp: i32,
+  pos: Vec,
+};
 
-  return T;
+type Range = (i32, i32);
+
+func vadd(a: Vec, b: Vec) -> Vec {
+  return Vec { x: a.x + b.x, y: a.y + b.y };
 }
 
-i: i32 = 2;
-n: i32 = 0;
-while (i < 1000000) {
-  if (is_prime(i)) {
-    n += 1;
-  }
+func divmod(a: i32, b: i32) -> (i32, i32) {
+  return (a / b, a % b);
+}
+
+func tier(hp: i32) -> str {
+  if (hp <= 0) return "dead";
+  if (hp < 10) return "wounded";
+  return "healthy";
+}
+
+func damage(p: Player, amount: i32) -> Player {
+  hp: i32 = p.hp - amount;
+  if (hp < 0) hp = 0;
+  return Player { name: p.name, hp: hp, pos: p.pos };
+}
+
+a: Vec = Vec { x: 3, y: 4 };
+b: Vec = Vec { x: 10, y: 20 };
+c: Vec = vadd(a, b);
+
+qr: (i32, i32) = divmod(c.x + c.y, 5);
+r: Range = (c.x, c.y);
+r = (r.1, r.0);
+
+acc: (i32, i32) = (0, 0);
+i: i32 = 1;
+while (i <= 5) {
+  acc = (acc.0 + 1, acc.1 + i * i);
   i += 1;
 }
+
+steve: Player = Player { name: "Steve", hp: 20, pos: a };
+steve = damage(steve, 7);
+steve.pos = vadd(steve.pos, Vec { x: 1, y: 1 });
+status: str = tier(steve.hp);
+
+steve = damage(steve, 100);
+status = tier(steve.hp);
+
+# Final state:
+#   c = (13, 24)   qr = (7, 2)   r = (24, 13)   acc = (5, 55)
+#   steve = { name: "Steve", hp: 0, pos: (4, 5) }   status = "dead"

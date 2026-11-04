@@ -42,6 +42,13 @@ class NBTContainer:
   ...
 
 
+def get_nbtpath(place: lowering.Place):
+  return ".".join(
+    seg if seg.isidentifier() or seg[0].isdigit() else json.dumps(seg)
+    for seg in (place.root, *place.fields)
+  )
+
+
 @dataclass(frozen=True)
 class Storage(NBTContainer):
   ns: str
@@ -491,7 +498,7 @@ class MCFuncBuilder:
             lowering.ScalarType.STR |
             lowering.ScalarType.FUNC
           ):
-            return NBTVar(op.path, self.stg)
+            return self.stg.get_nbtvar(get_nbtpath(op))
 
       case lowering.IntImm(val=val):
         return ScoreImm(int(val))
@@ -584,7 +591,6 @@ class MCFuncBuilder:
         self.emit(Execute((StoreScore(dst, StoreMode.SUCCESS), clause), None))
         return
 
-    self.emit(DataRemove(self.comp_tmp))
     self.emit(DataModify(self.comp_tmp, lhs))
     self.emit(Execute(
       (StoreScore(dst, StoreMode.SUCCESS),),

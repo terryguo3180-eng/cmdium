@@ -4,7 +4,6 @@ from cmdium import syntax
 from cmdium import error
 from cmdium.codegen import DatapackGen
 from cmdium.lowering import Lowering
-from cmdium.optimize import optimize
 from cmdium.semantic import Semantic
 
 
@@ -36,13 +35,6 @@ else:
     ir_funcs = Lowering(tree).lower()
     print("---")
     for ir_func in ir_funcs:
-      print(str(ir_func))
-      print()
-    print("---")
-
-    print("---")
-    for ir_func in ir_funcs:
-      optimize(ir_func)
       print(str(ir_func))
       print()
     print("---")

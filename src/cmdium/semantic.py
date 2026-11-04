@@ -387,13 +387,20 @@ class Semantic:
 
       case syntax.MemberAccess(src=src, att=att, span=span):
         self.analyze_expr(src)
-        if not isinstance(src.type, Struct):
-          raise error.CompileError(f"type {src.type!s} has no fields", span)
-        
-        if att not in src.type.fields:
-          raise error.CompileError(f"undeclared field name: {att!r}", span)
 
-        node.set_typeinfo(src.type.fields[att], src.lval)
+        match src.type:
+          case Tuple(fields=fields):
+            if not att.isdigit() or int(att) >= len(fields):
+              raise error.CompileError(f"tuple has no field {att!r}", span)
+            node.set_typeinfo(fields[int(att)], src.lval)
+
+          case Struct(fields=fields):
+            if att not in fields:
+              raise error.CompileError(f"undeclared field name: {att!r}", span)
+            node.set_typeinfo(fields[att], src.lval)
+        
+          case _ as ty:
+            raise error.CompileError(f"type {ty!s} has no fields", span)
 
       case syntax.Call(src=src, args=args, span=span):
         self.analyze_expr(src)
@@ -429,6 +436,42 @@ class Semantic:
 
           case utils.StrImm(val=val):
             node.set_typeinfo(BuiltinTypes.str, False)
+
+      case syntax.TupleLiteral(elems=elems):
+        for e in elems:
+          self.analyze_expr(e)
+        node.set_typeinfo(Tuple(tuple(e.type for e in elems)), False)
+
+      case syntax.StructLiteral(name=name, fields=fields, span=span):
+        ty = self.scope.lookup_type(name)
+        if not isinstance(ty, Struct):
+          raise error.CompileError(f"{name!r} is not a struct type", span)
+
+        seen: set[str] = set()
+        for f in fields:
+          self.analyze_expr(f.val)
+          if f.name not in ty.fields:
+            raise error.CompileError(
+              f"undeclared field name: {f.name!r}", f.span
+            )
+
+          if f.name in seen:
+            raise error.CompileError(f"duplicate field {f.name!r}", f.span)
+
+          if f.val.type != ty.fields[f.name]:
+            raise error.CompileError(
+              f"type {f.val.type!s} is not assignable to field type "
+              f"{ty.fields[f.name]!s}", f.val.span
+            )
+
+          seen.add(f.name)
+
+        if missing := ty.fields.keys() - seen:
+          raise error.CompileError(
+            f"missing field(s): {sorted(missing)}", span
+          )
+
+        node.set_typeinfo(ty, False)
 
   def analyze_type(self, node: syntax.TypeExpr) -> TypeInfo:    
     match node:

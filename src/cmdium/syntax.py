@@ -359,6 +359,25 @@ class ScalarLiteral(ExpressionBase):
   val: utils.Imm
 
 
+@dataclass
+class TupleLiteral(ExpressionBase):
+  elems: list[Expression]
+
+
+@dataclass
+class FieldInit(AST):
+  name: str
+  val: Expression
+  name_tok: Token
+
+
+@dataclass
+class StructLiteral(ExpressionBase):
+  name: str
+  fields: list[FieldInit]
+  name_tok: Token
+
+
 class TypeExprBase(AST):
   ...
 
@@ -394,7 +413,8 @@ RawStatement = (
 )
 Statement = Declaration | RawStatement
 Expression = (
-  BinaryExpr | UnaryExpr | Name | MemberAccess | Call | ScalarLiteral
+  BinaryExpr | UnaryExpr | Name | MemberAccess | Call | ScalarLiteral |
+  TupleLiteral | StructLiteral
 )
 TypeExpr = NamedType | FuncType | TupleType
 
@@ -772,7 +792,7 @@ class Parser:
         TokenKind.OP, ")"
       )
 
-      if comma:
+      if comma or not fields:
         return TupleType(fields).write_span(self.file, spos, self.prev_epos())
 
       return fields[0]  # grouped type
@@ -930,17 +950,49 @@ class Parser:
 
     return args
 
+  def parse_field_init(self) -> FieldInit | None:
+    # field_init : NAME ~ ":" expr
+    spos = self.curr_spos()
+
+    if name := self.accept(TokenKind.NAME):
+      self.expect("':'", TokenKind.OP, ":")
+      expr = self.expect_rule("expression", self.parse_expr)
+      return FieldInit(name.text, expr, name).write_span(
+        self.file, spos, self.prev_epos()
+      )
+
+    return None
+
   def parse_atom(self) -> Expression | None:
-    # atom : NAME
+    # atom : NAME "{" (field_init ("," field_init)* ","?)? ~ "}"
     #      | INT
     #      | STR
     #      | "T" | "F"
-    #      | "(" ~ expr ")"
+    #      | "( (expr ("," expr)* ","?)? ~ )"
 
     spos = self.curr_spos()
 
     if name := self.accept(TokenKind.NAME):
-      return Name(name.text).write_span(self.file, spos, self.prev_epos())
+      if not self.accept(TokenKind.OP, "{"):
+        return Name(name.text).write_span(self.file, spos, self.prev_epos())
+
+      comma = False
+      fields: list[FieldInit] = []
+      while field := self.parse_field_init():
+        fields.append(field)
+        if not self.accept(TokenKind.OP, ","):
+          break
+        else:
+          comma = True
+
+      self.expect(
+        "field initialize or '}'" if comma else "',' or '}'",
+        TokenKind.OP, "}"
+      )
+
+      return StructLiteral(name.text, fields, name).write_span(
+        self.file, spos, self.prev_epos()
+      )
 
     if tok := self.accept(TokenKind.INT):
       imm = utils.IntImm(int(tok.text))
@@ -968,9 +1020,26 @@ class Parser:
 
     mark = self.tell()
     if self.accept(TokenKind.OP, "("):
-      expr = self.expect_rule("expression", self.parse_expr)
-      self.expect("')'", TokenKind.OP, ")")
-      return expr
+      comma = False
+      exprs: list[Expression] = []
+      while expr := self.parse_expr():
+        exprs.append(expr)
+        if not self.accept(TokenKind.OP, ","):
+          break
+        else:
+          comma = True
+
+      self.expect(
+        "type expression or ')'" if comma else "',' or ')'",
+        TokenKind.OP, ")"
+      )
+
+      if comma or not exprs:  # tuple
+        return TupleLiteral(exprs).write_span(
+          self.file, spos, self.prev_epos()
+        )
+
+      return exprs[0]  # group
 
     self.seek(mark)
     return None
