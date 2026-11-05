@@ -45,8 +45,8 @@ tokens_pat = re.compile(r"""
   | (?P<STR>  "(?:[^"\\\n]|\\.)*")
   | (?P<NAME> \w+)
   | (?P<OP>   \+= | -= | \*= | /= | %= | <= | >= | == | != | -> | := |
-              \+ | - | \* | / | % | & | \| | = | ! | : | ; | \. | , | < | > |
-              \( | \) | \[ | \] | \{ | \} )
+              \+ | - | \* | / | % | @ | & | \| | = | ! | : | ; | \. | , |
+              < | > | \( | \) | \[ | \] | \{ | \} )
 """, re.X)
 
 
@@ -150,8 +150,28 @@ class CompilationUnit(AST):
   body: list[Statement]
 
 
+@dataclass
+class ParsedAttr(AST):
+  name: str
+  args: list[ScalarLiteral]
+  name_tok: Token
+
+
+@dataclass
 class StatementBase(AST):
-  ...
+  parsed_attrs: list[ParsedAttr] = field(
+    init=False, default_factory=list[ParsedAttr]
+  )
+  attrs: list[semantic.Attribute] = field(
+    init=False, default_factory=list[semantic.Attribute]
+  )
+
+  def write_parsed_attrs(self, attrs: list[ParsedAttr]) -> Self:
+    self.parsed_attrs = attrs
+    return self
+
+  def set_attrs(self, attrs: list[semantic.Attribute]):
+    self.attrs = attrs
 
 
 class RawStatementBase(StatementBase):
@@ -502,16 +522,54 @@ class Parser:
     return CompilationUnit(body).write_span(self.file, spos, self.prev_epos())
 
   def parse_stmt(self) -> Statement | None:
-    # stmt : decl
-    #      | raw_stmt
+    # stmt : attrs? (decl | raw_stmt)
     
+    attrs = self.parse_attrs()
+
     if decl := self.parse_decl():
-      return decl
+      return decl.write_parsed_attrs(attrs or [])
 
     if stmt := self.parse_raw_stmt():
-      return stmt
+      return stmt.write_parsed_attrs(attrs or [])
 
     return None
+
+  def parse_attrs(self) -> list[ParsedAttr]:
+    # attrs : attr+
+    attrs: list[ParsedAttr] = []
+    while attr := self.parse_attr():
+      attrs.append(attr)
+    return attrs
+
+  def parse_attr(self) -> ParsedAttr | None:
+    # attr : "@" ~ NAME ("(" (attr_arg ("," attr_arg)* ","?)? ")")?
+
+    spos = self.curr_spos()
+    if not self.accept(TokenKind.OP, "@"):
+      return None
+
+    name_tok = self.expect("attribute name", TokenKind.NAME)
+    args: list[ScalarLiteral] = []
+    if self.accept(TokenKind.OP, "("):
+      while arg := self.parse_attr_arg():
+        args.append(arg)
+        if not self.accept(TokenKind.OP, ","):
+          break
+      
+      self.expect("')'" if args else "literal or ')'", TokenKind.OP, ")")
+
+    return ParsedAttr(name_tok.text, args, name_tok).write_span(
+      self.file, spos, self.prev_epos()
+    )
+
+  def parse_attr_arg(self) -> ScalarLiteral | None:
+    # attr_arg : atom
+    arg = self.parse_atom()
+    if arg is not None and not isinstance(arg, ScalarLiteral):
+      raise error.CompileError(
+        "attribute argument must be a literal", arg.span
+      )
+    return arg
 
   def parse_raw_stmt(self) -> RawStatement | None:
     # raw_stmt : block

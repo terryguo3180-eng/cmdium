@@ -437,15 +437,17 @@ class Names:
     base = re.sub(r"[^A-Za-z0-9_.+\-]", "_", hint)
     n = self.counts.get(base, 0)
     self.counts[base] = n + 1
-    return f"{base}.{n}"
+    if n == 0:
+      return base
+    return f"{base}{n}"
 
   def make(
-    self, type: lowering.ScalarType, hint: str, temp: bool
+    self, type: lowering.ScalarType, hint: str, export: bool
   ) -> CommandVar:
     name = self.unique(hint)
     match type:
       case lowering.ScalarType.INT:
-        prefix = "#" if temp else "$"
+        prefix = "#$"[export]
         return ScoreVar(prefix + name, self.objective)
 
       case (
@@ -458,7 +460,7 @@ class Names:
 
   def get(self, var: lowering.Var) -> CommandVar:
     if var not in self.vars:
-      self.vars[var] = self.make(var.type, var.hint, var.temp)
+      self.vars[var] = self.make(var.type, var.hint, var.export)
     return self.vars[var]
 
   def get_ret(self, func: lowering.IRFunc, i: int) -> CommandVar:

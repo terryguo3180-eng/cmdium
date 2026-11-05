@@ -61,7 +61,7 @@ class Var:
   type: ScalarType
   hint: str
   id: int
-  temp: bool = False
+  export: bool = False
 
   def __str__(self):
     return f"%{self.hint}.{self.id}"
@@ -447,16 +447,16 @@ class FuncBuilder:
   def continue_block(self):
     return self.continue_stack[-1]
 
-  def new_var(self, type: ScalarType, hint: str, temp: bool = False) -> Var:
+  def new_var(self, type: ScalarType, hint: str, export: bool = False) -> Var:
     self.n_vars += 1
-    return Var(type, hint, self.n_vars, temp)
+    return Var(type, hint, self.n_vars, export)
 
   def temp(self, type: ScalarType) -> Var:
-    return self.new_var(type, "t", temp=True)
+    return self.new_var(type, "t")
 
-  def fresh(self, layout: Layout, hint: str, temp: bool = False) -> Val:
+  def fresh(self, layout: Layout, hint: str, export: bool = False) -> Val:
     return build(
-      layout, lambda path, type: self.new_var(type, hint + path, temp)
+      layout, lambda path, type: self.new_var(type, hint + path, export)
     )
 
   def copy_into(self, dst: Val, src: Val):
@@ -524,6 +524,8 @@ class Lowering:
     return [main.finish(), *(b.finish() for b in self.builders.values())]
 
   def lower_stmt(self, node: syntax.Statement):
+    attrs = node.attrs
+
     match node:
       case syntax.FuncDecl(name=name, body=body, sym=sym):
         if node.sym not in self.funcs:
@@ -540,7 +542,18 @@ class Lowering:
         else:
           ival = self.lower_expr(init)
 
-        dst = self.fb.fresh(layout, name)
+        export = False
+
+        for attr in attrs:
+          match attr:
+            case semantic.Export(hint=hint):
+              export = True
+              name = hint or name
+
+            case _:
+              raise NotImplementedError  # handled in semantic
+
+        dst = self.fb.fresh(layout, name, export)
         self.sym_vals[sym] = dst
         self.fb.copy_into(dst, ival)
 
@@ -550,7 +563,7 @@ class Lowering:
 
         # the elements may read dst, e.g. `t = (t.1, t.0);`
         if isinstance(val, (syntax.TupleLiteral, syntax.StructLiteral)):
-          tmp = self.fb.fresh(layout_of(val.type), "t", temp=True)
+          tmp = self.fb.fresh(layout_of(val.type), "t", export=False)
           self.fb.copy_into(tmp, val_v)
           val_v = tmp
 

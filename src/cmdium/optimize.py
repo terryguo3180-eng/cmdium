@@ -84,7 +84,7 @@ def local_opt(block: lowering.BasicBlock) -> None:
 
   def invalidate_for_call() -> None:
     for k, v in list(env.items()):
-      stable = k.temp and (not isinstance(v, lowering.Var) or v.temp)
+      stable = not (k.export or (isinstance(v, lowering.Var) and v.export))
       if not stable:
         del env[k]
 
@@ -159,8 +159,6 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
             used.update(args)
           case lowering.IndirectCall(target=t):
             used.add(t)
-          case _:
-            pass
 
       match b.term:
         case lowering.Branch(cond=c):
@@ -179,12 +177,12 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
         match inst:
           case (
             lowering.Copy(dst=d) | lowering.BinOp(dst=d)
-          ) if d.temp and d not in used:
+          ) if not (d.export or d in used):
             changed = True
           case lowering.Call(callee=callee, args=args, rets=rets):
             new_rets: list[lowering.Var | None] = []
             for r in rets:
-              if r is not None and r.temp and r not in used:
+              if not (r is None or r.export or r in used):
                 changed = True
                 r = None
               new_rets.append(r)

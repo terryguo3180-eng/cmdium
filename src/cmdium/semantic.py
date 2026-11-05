@@ -4,7 +4,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import auto
-from typing import Any
+from typing import Any, Self
 
 from cmdium import error
 from cmdium import syntax
@@ -65,6 +65,32 @@ class BuiltinTypes:
   bool = Prim(PrimKind.BOOL)
   void = Tuple(())
   str = Prim(PrimKind.STR)
+
+
+@dataclass
+class AttributeBase:
+  span: error.Span = field(init=False, repr=False)
+
+  def write_span(self, span: error.Span) -> Self:
+    self.span = span
+    return self
+
+
+@dataclass
+class Export(AttributeBase):
+  hint: str | None = None
+
+  def __str__(self):
+    return "export"
+
+
+@dataclass
+class Dummy(AttributeBase):
+  def __str__(self):
+    return "dummy"
+
+
+Attribute = Export | Dummy
 
 
 def binop_type(
@@ -265,11 +291,38 @@ class Semantic:
       case _:
         return False
 
+  def check_attrs(
+    self,
+    node: syntax.Statement,
+    allowed: set[type[Attribute]],
+    allow_dup: bool = False,
+  ):
+    attrs = [self.analyze_attr(a) for a in node.parsed_attrs]
+    seen: set[type[Attribute]] = set()
+
+    for attr in attrs:
+      ta = type(attr)
+  
+      if ta not in allowed:
+        raise error.CompileError(
+          f"attribute '{attr!s}' is not supported for this statement",
+          attr.span
+        )
+
+      if ta in seen and not allow_dup:
+        raise error.CompileError(f"duplicate attribute '{attr!s}'", attr.span)
+
+      seen.add(ta)
+
+    node.set_attrs(attrs)
+
   def analyze_stmt(self, node: syntax.Statement):
     match node:
       case syntax.VarDecl(
         name=name, type=type, init=init, name_tok=name_tok, span=span
       ):
+        self.check_attrs(node, {Export})
+
         ty = self.analyze_type(type)
         if init is not None:
           self.analyze_expr(init)
@@ -278,12 +331,13 @@ class Semantic:
               f"type {init.type!s} is not assignable to declared type {ty!s}",
               init.span
             )
-
         sym = Symbol(name, ty)
         node.set_symbol(sym)
         self.scope.declare_name(name, sym, name_tok.span)
 
       case syntax.Assign(dst=dst, val=val, span=span):
+        self.check_attrs(node, set())
+
         self.analyze_expr(dst)
         self.analyze_expr(val)
 
@@ -301,6 +355,8 @@ class Semantic:
           )
 
       case syntax.AugAssign(dst=dst, bop=bop, val=val):
+        self.check_attrs(node, set())
+
         self.analyze_expr(dst)
         self.analyze_expr(val)
 
@@ -313,23 +369,32 @@ class Semantic:
         binop_type(bop, dst_ty, val_ty)
 
       case syntax.Block(body=body):
+        self.check_attrs(node, set())
+
         with self.with_scope():
           self.declare_items(body)
           for stmt in body:
             self.analyze_stmt(stmt)
 
       case syntax.Break(span=span):
+        self.check_attrs(node, set())
+
         if not self.inside_loop:
           raise error.CompileError("break statement outside loop", span)
 
       case syntax.Continue(span=span):
+        self.check_attrs(node, set())
+
         if not self.inside_loop:
           raise error.CompileError("continue statement outside loop", span)
 
       case syntax.StructDecl() | syntax.TypeDecl():
+        self.check_attrs(node, set())
         pass  # declared by declare_items
 
       case syntax.FuncDecl(params=params, body=body):
+        self.check_attrs(node, set())
+
         fty = node.sym.type  # set by declare_items
         assert isinstance(fty, Function)
         with self.with_scope():
@@ -344,9 +409,13 @@ class Semantic:
             self.analyze_stmt(body)
 
       case syntax.ExprStmt(val=val):
+        self.check_attrs(node, set())
+
         self.analyze_expr(val)
 
       case syntax.If(test=test, body=body, orelse=orelse):
+        self.check_attrs(node, set())
+
         self.analyze_expr(test)
         if test.type != BuiltinTypes.bool:
           raise error.CompileError(
@@ -359,9 +428,11 @@ class Semantic:
           self.analyze_stmt(orelse)
 
       case syntax.Pass():
-        pass
+        self.check_attrs(node, set())
 
       case syntax.Return(val=val, span=span):
+        self.check_attrs(node, set())
+
         if not self.inside_func:
           raise error.CompileError("return statement outside function", span)
 
@@ -380,6 +451,8 @@ class Semantic:
           )
 
       case syntax.While(test=test, body=body):
+        self.check_attrs(node, set())
+        
         if test is not None:
           self.analyze_expr(test)
           if test.type != BuiltinTypes.bool:
@@ -517,3 +590,27 @@ class Semantic:
           [self.analyze_type(p) for p in params],
           self.analyze_type(ret_type)
         )
+
+  def analyze_attr(self, node: syntax.ParsedAttr) -> Attribute:
+    match node.name:
+      case "export":
+        match node.args:
+          case []:
+            return Export().write_span(node.span)
+
+          case [syntax.ScalarLiteral(val=utils.StrImm(val=name))]:
+            return Export(name).write_span(node.span)
+
+          case _:
+            raise error.CompileError(
+              f"invalid args for attribute {node.name!r}", node.span
+            )
+
+      case "dummy":
+        return Dummy().write_span(node.span)
+
+      case _:
+        raise error.CompileError(
+          f"unknown attribute: {node.name!r}", node.name_tok.span
+        )
+      
