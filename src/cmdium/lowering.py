@@ -53,7 +53,8 @@ def layout_of(type: semantic.TypeInfo) -> Layout:
       )
 
     case semantic.Function():
-      raise NotImplementedError("function values have no layout yet")
+      # a function value is stored as the target function's name
+      return Scalar(ScalarType.FUNC)
 
 
 @dataclass(eq=False)
@@ -142,7 +143,9 @@ def zero_of(type: ScalarType) -> ImmValue:
       return LabelImm(BasicBlock("-.-", []))
 
     case ScalarType.FUNC:
-      return FuncImm(IRFunc("-.-", [], [], []))
+      # '-.-', never used but valid; needs an entry block so that FuncImm
+      # always has somewhere to point at
+      return FuncImm(IRFunc("-.-", [], [], [BasicBlock("-.-", [])]))
 
     case ScalarType.STR:
       return StrImm("")
@@ -268,6 +271,18 @@ class BasicBlock:
     return s.strip()
 
 
+@dataclass(frozen=True)
+class Signature:
+  """A call frame: the scalar leaves of the parameters and the results.
+
+  Functions and call sites with the same signature share one frame, which is
+  what lets an indirect call pass arguments without knowing the callee.
+  """
+
+  params: tuple[ScalarType, ...]
+  rets: tuple[ScalarType, ...]
+
+
 @dataclass(eq=False)
 class IRFunc:
   name: str
@@ -280,6 +295,10 @@ class IRFunc:
   @property
   def entry(self) -> BasicBlock:
     return self.blocks[0]
+
+  @property
+  def signature(self) -> Signature:
+    return Signature(tuple(p.type for p in self.params), tuple(self.ret_types))
 
   def __str__(self):
     params = ", ".join(str(p) for p in self.params)
@@ -311,8 +330,26 @@ class Call:
 
 @dataclass
 class IndirectCall:
-  target: Var  # LABEL
-  possible: tuple[IRFunc, ...]
+  """A call through a function value."""
+
+  target: Var
+  args: tuple[Operand, ...]
+  rets: tuple[Var | None, ...]  # None: result is unused
+  signature: Signature
+
+  def __post_init__(self):
+    assert self.target.type == ScalarType.FUNC
+    assert len(self.args) == len(self.signature.params)
+    assert len(self.rets) == len(self.signature.rets)
+
+  def __str__(self):
+    args = ", ".join(str(a) for a in self.args)
+    call = f"call* {self.target!s}({args})"
+    if all(r is None for r in self.rets):
+      return call
+
+    rets = ", ".join("_" if r is None else str(r) for r in self.rets)
+    return f"{rets} = {call}"
 
 
 IR = Copy | BinOp | Call | IndirectCall
@@ -689,16 +726,36 @@ class Lowering:
         return dst
 
       case syntax.Call(src=src, args=args):
-        if not isinstance(src, syntax.Name):
-          raise NotImplementedError("indirect call not supported yet")
-        callee = self.funcs[src.sym]
-
         call_args: list[Operand] = []
         for a in args:
           call_args.extend(leaves(self.lower_expr(a)))
 
-        rets = [self.fb.temp(t) for t in callee.ret_types]
-        self.fb.emit(Call(FuncImm(callee), tuple(call_args), tuple(rets)))
+        callee = (
+          self.funcs[src.sym]
+          if isinstance(src, syntax.Name) and src.sym in self.funcs
+          else None
+        )
+
+        if callee is not None:
+          rets = [self.fb.temp(t) for t in callee.ret_types]
+          self.fb.emit(Call(
+            FuncImm(callee), tuple(call_args), tuple(rets)
+          ))
+        else:
+          ftype = src.type
+          assert isinstance(ftype, semantic.Function)
+          signature = Signature(
+            tuple(
+              t for p in ftype.params for t in leaf_types(layout_of(p))
+            ),
+            tuple(leaf_types(layout_of(ftype.ret_type))),
+          )
+          rets = [self.fb.temp(t) for t in signature.rets]
+          target = self.lower_scalar(src)
+          assert isinstance(target, Var)
+          self.fb.emit(IndirectCall(
+            target, tuple(call_args), tuple(rets), signature
+          ))
 
         it = iter(rets)
         return build(layout_of(node.type), lambda _, __: next(it))
@@ -736,6 +793,8 @@ class Lowering:
   def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Val:
     match node:
       case syntax.Name(sym=sym):
+        if sym in self.funcs:
+          return FuncImm(self.funcs[sym])
         return self.sym_vals[sym]
 
       case syntax.MemberAccess(src=src, att=att):

@@ -58,6 +58,7 @@ TypeInfo = Prim | Struct | Tuple | Function
 class Symbol:
   name: str
   type: TypeInfo
+  is_func: bool = False  # declared with `func`, not by a variable
 
 
 class BuiltinTypes:
@@ -303,7 +304,7 @@ class Semantic:
       else:
         ret = self.analyze_type(fn.ret_type)
       params = [self.analyze_type(p.type) for p in fn.params]
-      sym = Symbol(fn.name, Function(params, ret))
+      sym = Symbol(fn.name, Function(params, ret), is_func=True)
       fn.set_symbol(sym)
       self.scope.declare_name(fn.name, sym, fn.name_tok.span)
 
@@ -376,6 +377,11 @@ class Semantic:
         if not dst.lval:
           raise error.CompileError(
             "cannot assign to this expression", dst.span
+          )
+
+        if isinstance(dst, syntax.Name) and dst.sym.is_func:
+          raise error.CompileError(
+            f"cannot assign to function {dst.name!r}", dst.span
           )
 
         dst_ty, val_ty = dst.type, val.type

@@ -13,6 +13,8 @@ Target: **Minecraft JE 1.21+** (`pack_format` 48 by default).
 
 - Static typing with `i32`, `bool`, `str`, tuples, structs and function types
 - Functions with parameters and return values
+- Function values: assign, pass, return and call them indirectly (each target
+  cell gets a macro trampoline, no candidate scan)
 - Control flow: `if` / `else`, `while`, `break`, `continue`, `return`
 - Arithmetic, comparison and logical operators
 - Variable declarations, assignment and compound assignment (`+=`, `-=`, …)
@@ -200,6 +202,18 @@ Planned (rough order):
 - [ ] More aggressive optimisations
 
 Contributions and ideas are welcome once the core stabilises.
+
+---
+
+## Performance
+
+Command costs were measured on a real server, in-chain with `/stopwatch`:
+a `function` call is ~90 ns of overhead, a scoreboard operation ~100 ns,
+a macro dispatch ~260 ns on a cache hit and ~700 ns on a miss, and a deep call
+chain costs the same per level at depth 200 and depth 20 000.
+
+See [docs/performance.md](docs/performance.md) for the tables, the measurement
+method, and the codegen decisions they justify.
 
 ---
 

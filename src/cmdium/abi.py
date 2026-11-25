@@ -70,6 +70,14 @@ class ABI:
     self._counts[base] = n + 1
     return base if n == 0 else f"{base}{n}"
 
+  # a macro variable has to be a plain word; anything else (aggregate members
+  # keep dots, for instance) is not usable as `$(name)`
+  MACRO_NAME = re.compile(r"[A-Za-z0-9_]+")
+
+  @classmethod
+  def is_macro_name(cls, name: str) -> bool:
+    return cls.MACRO_NAME.fullmatch(name) is not None
+
   def name(self, slot: Slot) -> str:
     name = self._names.get(slot)
     if name is not None:
@@ -109,6 +117,10 @@ class ABI:
     match lit.type:
       case lowering.ScalarType.STR:
         return json.dumps(lit.value, ensure_ascii=False)
+
+      case lowering.ScalarType.FUNC:
+        assert isinstance(lit.value, str)
+        return json.dumps(self.func_name(lit.value), ensure_ascii=False)
 
       case lowering.ScalarType.INT:
         return str(lit.value)
@@ -170,6 +182,13 @@ class ABI:
     )
 
   # -- nbt -----------------------------------------------------------------
+  def if_data(self, slot: Slot, lit: Lit, neg: bool = False) -> str:
+    cond = ("if", "unless")[neg]
+    return (
+      f"{cond} data {self.container()} "
+      f"{{{self.data_path(slot)}:{self.lit(lit)}}}"
+    )
+
   def copy_data(self, dst: Slot, src: Slot) -> str:
     return f"data modify {self.data_ref(dst)} set from {self.data_ref(src)}"
 
@@ -181,10 +200,9 @@ class ABI:
   ) -> list[str]:
     """dst = (lhs == rhs), where values live in NBT."""
     if isinstance(rhs, Lit):
-      cond = ("if", "unless")[not eq]
       return [
-        f"execute store success score {self.score_ref(dst)} {cond} data "
-        f"{self.container()} {{{self.data_path(lhs)}:{self.lit(rhs)}}}"
+        f"execute store success score {self.score_ref(dst)} "
+        f"{self.if_data(lhs, rhs, neg=not eq)}"
       ]
 
     # `data modify` reports failure when nothing changes, so a staged copy
@@ -202,8 +220,27 @@ class ABI:
     return cmds
 
   # -- functions -----------------------------------------------------------
+  def func_name(self, block: str) -> str:
+    """The name a function value is stored under."""
+    return f"{self.namespace}:{block}"
+
   def call(self, block: str) -> str:
-    return f"function {self.namespace}:{block}"
+    return f"function {self.func_name(block)}"
+
+  # A function value is a macro argument: one trampoline per storage cell
+  # expands to a call of whatever name that cell holds.  The cell's data path
+  # doubles as the macro variable name.
+  def dispatch_name(self, slot: Slot) -> str:
+    return f".dispatch/{self.name(slot)}"
+
+  def dispatch_body(self, slot: Slot) -> str:
+    return f"$function $({self.name(slot)})"
+
+  def dispatch_call(self, slot: Slot) -> str:
+    return (
+      f"function {self.func_name(self.dispatch_name(slot))} "
+      f"with {self.container()}"
+    )
 
   def jump(self, block: str, cond: str | None = None) -> str:
     cmd = f"return run {self.call(block)}"

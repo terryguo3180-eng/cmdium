@@ -41,6 +41,9 @@ class FuncGen:
       case lowering.StrImm(val=val):
         return Lit(lowering.ScalarType.STR, val)
 
+      case lowering.FuncImm(func=func):
+        return func_lit(func)
+
       case _:
         raise NotImplementedError(f"operand {op!r} as a value")
 
@@ -137,6 +140,23 @@ class FuncGen:
         self.emit(self.abi.op_score(dst, op, self.slot_of(rhs)))
 
 
+@dataclass
+class Frame:
+  """Argument and result slots shared by all calls with one signature.
+
+  Sharing by signature (rather than per function) is what lets an indirect
+  call move values without knowing which function it is going to hit.
+  """
+
+  args: list[Slot]
+  rets: list[Slot]
+
+
+def func_lit(func: lowering.IRFunc) -> Lit:
+  """The value stored for a function address."""
+  return Lit(lowering.ScalarType.FUNC, func.entry.name)
+
+
 class DatapackGen:
   def __init__(
     self, ir_funcs: list[lowering.IRFunc], ns: str, setup: str = ".setup"
@@ -153,9 +173,40 @@ class DatapackGen:
     self.slots = SlotTable(exports)
     self.abi = ABI(ns, ns, self.slots)
 
+    # An exported name is part of the pack's interface, so it is claimed
+    # before any internal variable that happens to share the same hint.
+    for var in exports:
+      self.abi.name(self.slots.of_var(var))
+
     self.tmp = self.slots.alloc(Store.SCORE)
-    self.ret_slots: dict[tuple[lowering.IRFunc, int], Slot] = {}
     self.funcs: dict[str, MCFunction] = {}
+    self.frames: dict[lowering.Signature, Frame] = {}
+
+    # target slot -> generated macro trampoline, one per cell, filled lazily
+    self.dispatchers: dict[Slot, str] = {}
+    self._dispatch_tmp: Slot | None = None
+
+  def dispatch(self, slot: Slot) -> str:
+    """The trampoline that calls whatever function value `slot` holds."""
+    name = self.dispatchers.get(slot)
+    if name is None:
+      name = self.abi.dispatch_name(slot)
+      self.dispatchers[slot] = name
+    return name
+
+  def dispatch_slot(self, fg: FuncGen, slot: Slot) -> Slot:
+    """The cell a macro can read the function value from.
+
+    Macro variables must be plain words, but a cell like `pair.1` is a
+    perfectly good NBT key.  Such a cell is staged into a scratch cell first.
+    """
+    if self.abi.is_macro_name(self.abi.name(slot)):
+      return slot
+
+    if self._dispatch_tmp is None:
+      self._dispatch_tmp = self.slots.alloc(Store.NBT, hint="dispatch")
+    fg.copy(self._dispatch_tmp, slot)
+    return self._dispatch_tmp
 
   @contextmanager
   def with_func(self, name: str):
@@ -165,31 +216,59 @@ class DatapackGen:
     finally:
       self.funcs[name] = func.func
 
-  def ret_slot(self, func: lowering.IRFunc, i: int) -> Slot:
-    key = (func, i)
-    slot = self.ret_slots.get(key)
-    if slot is None:
-      slot = self.slots.alloc(store_of(func.ret_types[i]))
-      self.ret_slots[key] = slot
-    return slot
+  def frame(self, sig: lowering.Signature) -> Frame:
+    frame = self.frames.get(sig)
+    if frame is None:
+      frame = Frame(
+        args=[self.slots.alloc(store_of(t)) for t in sig.params],
+        rets=[self.slots.alloc(store_of(t)) for t in sig.rets],
+      )
+      self.frames[sig] = frame
+    return frame
 
   def gen(self) -> dict[str, MCFunction]:
     for func in self.ir_funcs:
+      frame = self.frame(func.signature)
       for block in func.blocks:
         with self.with_func(block.name) as fg:
+          if block is func.entry:
+            self.gen_prologue(fg, func, frame)
+
           for inst in block.body:
             self.gen_inst(fg, inst)
           if block.term is not None:
             self.gen_term(fg, func, block.term)
 
+    self.write_dispatchers()
     self.write_setup()
     return self.funcs
+
+  def write_dispatchers(self):
+    """One macro function per indirect-call target cell.
+
+    `$function $(<cell>)` reads the name out of the slot container, so the
+    target never has to be compared against a list of candidates.
+    """
+    for slot, name in self.dispatchers.items():
+      with self.with_func(name) as fg:
+        fg.emit(self.abi.dispatch_body(slot))
 
   def write_setup(self):
     with self.with_func(self.setup) as fg:
       fg.emit(self.abi.add_objective())
       for slot in self.slots.consts():
         fg.emit(self.abi.init_const(slot))
+
+  def gen_prologue(
+    self, fg: FuncGen, func: lowering.IRFunc, frame: Frame
+  ):
+    """Move the shared arguments into this function's own parameters.
+
+    Without the copy, a same-signature call made by the callee would clobber
+    the parameters of its caller.
+    """
+    for param, src in zip(func.params, frame.args, strict=True):
+      fg.copy(self.slots.of_var(param), src)
 
   def gen_inst(self, fg: FuncGen, inst: lowering.IR):
     match inst:
@@ -202,18 +281,62 @@ class DatapackGen:
         )
 
       case lowering.Call(callee=callee, args=args, rets=rets):
-        func = callee.func
-        for param, arg in zip(func.params, args, strict=True):
-          fg.copy(self.slots.of_var(param), fg.value(arg))
+        self.gen_call(fg, callee.func, args, rets)
 
-        fg.emit(self.abi.call(func.entry.name))
+      case lowering.IndirectCall(
+        target=target, args=args, rets=rets, signature=sig
+      ):
+        self.gen_indirect_call(fg, target, args, rets, sig)
 
-        for i, ret in enumerate(rets):
-          if ret is not None:
-            fg.copy(self.slots.of_var(ret), self.ret_slot(func, i))
+  def gen_call(
+    self,
+    fg: FuncGen,
+    func: lowering.IRFunc,
+    args: tuple[lowering.Operand, ...],
+    rets: tuple[lowering.Var | None, ...],
+  ):
+    frame = self.frame(func.signature)
+    self.gen_args(fg, frame, args)
+    fg.emit(self.abi.call(func.entry.name))
+    self.gen_rets(fg, frame, rets)
 
-      case lowering.IndirectCall():
-        raise NotImplementedError("indirect calls are not supported")
+  def gen_indirect_call(
+    self,
+    fg: FuncGen,
+    target: lowering.Var,
+    args: tuple[lowering.Operand, ...],
+    rets: tuple[lowering.Var | None, ...],
+    sig: lowering.Signature,
+  ):
+    frame = self.frame(sig)
+    self.gen_args(fg, frame, args)
+
+    # a macro line expands the function value held in the cell into a call,
+    # which is cheaper than testing the value against every candidate
+    slot = self.dispatch_slot(fg, self.slots.of_var(target))
+    self.dispatch(slot)
+    fg.emit(self.abi.dispatch_call(slot))
+
+    self.gen_rets(fg, frame, rets)
+
+  def gen_args(
+    self,
+    fg: FuncGen,
+    frame: Frame,
+    args: tuple[lowering.Operand, ...],
+  ):
+    for slot, arg in zip(frame.args, args, strict=True):
+      fg.copy(slot, fg.value(arg))
+
+  def gen_rets(
+    self,
+    fg: FuncGen,
+    frame: Frame,
+    rets: tuple[lowering.Var | None, ...],
+  ):
+    for slot, ret in zip(frame.rets, rets, strict=True):
+      if ret is not None:
+        fg.copy(self.slots.of_var(ret), slot)
 
   def gen_term(self, fg: FuncGen, func: lowering.IRFunc, term: lowering.Terminator):
     match term:
@@ -227,8 +350,9 @@ class DatapackGen:
         fg.emit(self.abi.jump(orelse.bb.name))
 
       case lowering.Ret(values=values):
-        for i, val in enumerate(values):
-          fg.copy(self.ret_slot(func, i), fg.value(val))
+        frame = self.frame(func.signature)
+        for slot, val in zip(frame.rets, values, strict=True):
+          fg.copy(slot, fg.value(val))
         fg.emit(self.abi.ret())
 
       case lowering.IndirectJump():
