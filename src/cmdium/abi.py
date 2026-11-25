@@ -59,6 +59,7 @@ class ABI:
     self.slots = slots
 
     self._names: dict[Slot, str] = {}
+    self._bases: dict[Slot, str] = {}
     self._counts: dict[str, int] = {}
     # NBT equality of two slots needs somewhere to stage a copy
     self._scratch = slots.alloc(Store.NBT)
@@ -91,13 +92,23 @@ class ABI:
       # unnamed internal slots are named after their id
       hint = f"v{slot.id}"
 
-    name = self._unique(hint)
+    base = self._unique(hint)
+    self._bases[slot] = base
 
+    name = base
     if slot.store is Store.SCORE:
-      name = ("$" if slot.export_name is not None else "#") + name
+      name = ("$" if slot.export_name is not None else "#") + base
 
     self._names[slot] = name
     return name
+
+  def base(self, slot: Slot) -> str:
+    """The name of a cell without the scoreboard holder prefix.
+
+    A pointer stores this, and `#$(p)` turns it back into a holder.
+    """
+    self.name(slot)
+    return self._bases[slot]
 
   def container(self) -> str:
     return f"storage {self.namespace}:main"
@@ -115,7 +126,7 @@ class ABI:
   # -- literals ------------------------------------------------------------
   def lit(self, lit: Lit) -> str:
     match lit.type:
-      case lowering.ScalarType.STR:
+      case lowering.ScalarType.STR | lowering.ScalarType.PTR:
         return json.dumps(lit.value, ensure_ascii=False)
 
       case lowering.ScalarType.FUNC:
@@ -227,6 +238,10 @@ class ABI:
   def call(self, block: str) -> str:
     return f"function {self.func_name(block)}"
 
+  def macro_call(self, block: str) -> str:
+    """Call a macro function: the slot container provides its arguments."""
+    return f"function {self.func_name(block)} with {self.container()}"
+
   # A function value is a macro argument: one trampoline per storage cell
   # expands to a call of whatever name that cell holds.  The cell's data path
   # doubles as the macro variable name.
@@ -237,10 +252,44 @@ class ABI:
     return f"$function $({self.name(slot)})"
 
   def dispatch_call(self, slot: Slot) -> str:
+    return self.macro_call(self.dispatch_name(slot))
+
+  # -- pointers ------------------------------------------------------------
+  # A pointer value is the base name of a cell, so `$(key)` inside the
+  # command text turns it into a cell reference: `#q.x` for a score, `q.x`
+  # for a data path.
+  def deref_read_score(self, key: str, path: str, dst: Slot) -> str:
+    holder = f"#$(%s){path}" % key
     return (
-      f"function {self.func_name(self.dispatch_name(slot))} "
-      f"with {self.container()}"
+      f"$scoreboard players operation {self.score_ref(dst)} = "
+      f"{holder} {self.objective}"
     )
+
+  def deref_read_data(self, key: str, path: str, dst: Slot) -> str:
+    # cell names are flat keys, so the whole substituted path is one quoted
+    # key (`s.name` would otherwise mean two nested keys)
+    target = '"$(%s)%s"' % (key, path)
+    return (
+      f"$data modify {self.data_ref(dst)} set from {self.container()} "
+      f"{target}"
+    )
+
+  def deref_write_score(self, key: str, path: str, src: Slot) -> str:
+    holder = f"#$(%s){path}" % key
+    return (
+      f"$scoreboard players operation {holder} {self.objective} = "
+      f"{self.score_ref(src)}"
+    )
+
+  def deref_write_data(self, key: str, path: str, src: Slot) -> str:
+    target = '"$(%s)%s"' % (key, path)
+    return (
+      f"$data modify {self.container()} {target} set from "
+      f"{self.data_ref(src)}"
+    )
+
+  def guard(self, cond: str, cmd: str) -> str:
+    return f"execute {cond} run {cmd}"
 
   def jump(self, block: str, cond: str | None = None) -> str:
     cmd = f"return run {self.call(block)}"

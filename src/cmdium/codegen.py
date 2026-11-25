@@ -17,6 +17,10 @@ class MCFunction:
     self.cmds.extend(cmds)
 
 
+# (macro variable, data path, pointee store, "read" | "write")
+DerefKey = tuple[str, str, Store, str]
+
+
 class FuncGen:
   """Emits one mcfunction in terms of slots; it never spells out syntax."""
 
@@ -43,6 +47,9 @@ class FuncGen:
 
       case lowering.FuncImm(func=func):
         return func_lit(func)
+
+      case lowering.PtrImm(val=val):
+        return Lit(lowering.ScalarType.PTR, val)
 
       case _:
         raise NotImplementedError(f"operand {op!r} as a value")
@@ -186,6 +193,12 @@ class DatapackGen:
     self.dispatchers: dict[Slot, str] = {}
     self._dispatch_tmp: Slot | None = None
 
+    # pointer trampolines: cache key -> function name, plus their bodies
+    self._derefs: dict[DerefKey, str] = {}
+    self._deref_bodies: dict[str, str] = {}
+    self._deref_tmp: dict[Store, Slot] = {}
+    self._pointer_tmp: Slot | None = None
+
   def dispatch(self, slot: Slot) -> str:
     """The trampoline that calls whatever function value `slot` holds."""
     name = self.dispatchers.get(slot)
@@ -240,8 +253,104 @@ class DatapackGen:
             self.gen_term(fg, func, block.term)
 
     self.write_dispatchers()
+    self.write_derefs()
     self.write_setup()
     return self.funcs
+
+  def write_derefs(self):
+    for name, body in self._deref_bodies.items():
+      with self.with_func(name) as fg:
+        fg.emit(body)
+
+  # -- pointers ------------------------------------------------------------
+  def ptr_base(self, val: lowering.Val, path: str = "") -> str:
+    """The name prefix shared by the cells of a pointer target."""
+    match val:
+      case lowering.Agg(fields=fields):
+        if not fields:
+          raise RuntimeError("an empty aggregate has no address")
+        name, sub = fields[0]
+        return self.ptr_base(sub, f"{path}.{name}" if path else name)
+
+      case _:
+        assert isinstance(val, lowering.Var), val
+        base = self.abi.base(self.slots.of_var(val))
+        if not path:
+          return base
+
+        suffix = "." + path
+        if not base.endswith(suffix):
+          raise RuntimeError(
+            f"cannot locate the base of {base!r} for path {path!r}"
+          )
+        return base[: -len(suffix)]
+
+  def pointer_tmp(self) -> Slot:
+    """A cell a macro can read any pointer value from."""
+    if self._pointer_tmp is None:
+      self._pointer_tmp = self.slots.alloc(Store.NBT, hint="deref_ptr")
+    return self._pointer_tmp
+
+  def deref_key(self, fg: FuncGen, ptr_slot: Slot) -> str:
+    """The macro variable that carries this pointer's value."""
+    base = self.abi.base(ptr_slot)
+    if self.abi.is_macro_name(base):
+      return base
+
+    tmp = self.pointer_tmp()
+    fg.copy(tmp, ptr_slot)
+    return self.abi.base(tmp)
+
+  def deref_scratch(self, store: Store) -> Slot:
+    slot = self._deref_tmp.get(store)
+    if slot is None:
+      slot = self.slots.alloc(store, hint="deref")
+      self._deref_tmp[store] = slot
+    return slot
+
+  def deref_trampoline(self, key: DerefKey, body: str) -> str:
+    name = self._derefs.get(key)
+    if name is None:
+      name = f".deref/{len(self._derefs)}"
+      self._derefs[key] = name
+      self._deref_bodies[name] = body
+    return name
+
+  def gen_load_ptr(
+    self, fg: FuncGen, dst: lowering.Var, ptr: lowering.Var,
+    path: str, type: lowering.ScalarType,
+  ):
+    store = store_of(type)
+    scratch = self.deref_scratch(store)
+    key = self.deref_key(fg, self.slots.of_var(ptr))
+
+    body = (
+      self.abi.deref_read_score(key, path, scratch)
+      if store is Store.SCORE
+      else self.abi.deref_read_data(key, path, scratch)
+    )
+    name = self.deref_trampoline((key, path, store, "read"), body)
+
+    fg.emit(self.abi.macro_call(name))
+    fg.copy(self.slots.of_var(dst), scratch)
+
+  def gen_store_ptr(
+    self, fg: FuncGen, ptr: lowering.Var, path: str,
+    type: lowering.ScalarType, src: lowering.Operand,
+  ):
+    store = store_of(type)
+    scratch = self.deref_scratch(store)
+    fg.copy(scratch, fg.value(src))
+
+    key = self.deref_key(fg, self.slots.of_var(ptr))
+    body = (
+      self.abi.deref_write_score(key, path, scratch)
+      if store is Store.SCORE
+      else self.abi.deref_write_data(key, path, scratch)
+    )
+    name = self.deref_trampoline((key, path, store, "write"), body)
+
+    fg.emit(self.abi.macro_call(name))
 
   def write_dispatchers(self):
     """One macro function per indirect-call target cell.
@@ -287,6 +396,18 @@ class DatapackGen:
         target=target, args=args, rets=rets, signature=sig
       ):
         self.gen_indirect_call(fg, target, args, rets, sig)
+
+      case lowering.AddrOf(dst=dst, target=target):
+        fg.emit(self.abi.set_data(
+          self.slots.of_var(dst),
+          Lit(lowering.ScalarType.PTR, self.ptr_base(target)),
+        ))
+
+      case lowering.LoadPtr(dst=dst, ptr=ptr, path=path, type=type):
+        self.gen_load_ptr(fg, dst, ptr, path, type)
+
+      case lowering.StorePtr(ptr=ptr, path=path, type=type, src=src):
+        self.gen_store_ptr(fg, ptr, path, type, src)
 
   def gen_call(
     self,

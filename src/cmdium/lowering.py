@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import auto
+from typing import cast
 
 from cmdium import semantic
 from cmdium import syntax
@@ -17,6 +18,11 @@ class ScalarType(utils.DataEnum):
   LABEL = auto()
   FUNC = auto()
   STR = auto()
+  PTR = auto()  # a pointer: the cell name of the referenced storage
+
+
+# a pointer that does not refer to anything; no cell is ever named like this
+NULL_PTR = "<null>"
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,13 @@ def layout_of(type: semantic.TypeInfo) -> Layout:
     case semantic.Function():
       # a function value is stored as the target function's name
       return Scalar(ScalarType.FUNC)
+
+    case semantic.Ref():
+      # whatever it points at, the pointer itself is one string cell
+      return Scalar(ScalarType.PTR)
+
+    case semantic.Null():
+      raise NotImplementedError("the null literal has no storage layout")
 
 
 @dataclass(eq=False)
@@ -115,7 +128,21 @@ class StrImm:
     return json.dumps(self.val, ensure_ascii=False)
 
 
-ImmValue = IntImm | LabelImm | FuncImm | StrImm
+@dataclass(frozen=True)
+class PtrImm:
+  """A pointer literal: the cell name of the referenced storage."""
+
+  val: str
+
+  @property
+  def type(self) -> ScalarType:
+    return ScalarType.PTR
+
+  def __str__(self):
+    return json.dumps(self.val, ensure_ascii=False)
+
+
+ImmValue = IntImm | LabelImm | FuncImm | StrImm | PtrImm
 Operand = Var | ImmValue
 
 
@@ -149,6 +176,10 @@ def zero_of(type: ScalarType) -> ImmValue:
 
     case ScalarType.STR:
       return StrImm("")
+
+    case ScalarType.PTR:
+      # an uninitialised pointer is null, so a stale value cannot be followed
+      return PtrImm(NULL_PTR)
 
 
 class BinaryOp(utils.DataEnum):
@@ -352,7 +383,55 @@ class IndirectCall:
     return f"{rets} = {call}"
 
 
-IR = Copy | BinOp | Call | IndirectCall
+@dataclass
+class AddrOf:
+  """`dst = &target` — the cell name of `target`, as a pointer value."""
+
+  dst: Var
+  target: Val  # a Var, or an Agg whose leaves share one name prefix
+
+  def __post_init__(self):
+    assert self.dst.type == ScalarType.PTR
+
+  def __str__(self):
+    return f"{self.dst!s} = &{self.target!s}"
+
+
+@dataclass
+class LoadPtr:
+  """`dst = ptr&path` — read the cell a pointer refers to."""
+
+  dst: Var
+  ptr: Var
+  path: str
+  type: ScalarType  # of the pointee leaf, so also of `dst`
+
+  def __post_init__(self):
+    assert self.ptr.type == ScalarType.PTR
+    assert self.dst.type == self.type
+
+  def __str__(self):
+    return f"{self.dst!s} = {self.ptr!s}&{self.path}"
+
+
+@dataclass
+class StorePtr:
+  """`ptr&path = src` — write through a pointer."""
+
+  ptr: Var
+  path: str
+  type: ScalarType
+  src: Operand
+
+  def __post_init__(self):
+    assert self.ptr.type == ScalarType.PTR
+    assert self.src.type == self.type
+
+  def __str__(self):
+    return f"{self.ptr!s}&{self.path} = {self.src!s}"
+
+
+IR = Copy | BinOp | Call | IndirectCall | AddrOf | LoadPtr | StorePtr
 Terminator = Jump | IndirectJump | Branch | Ret
 
 
@@ -465,7 +544,7 @@ class FuncBuilder:
       case IntImm(val=v):
         self.goto(then if v else orelse)
 
-      case LabelImm() | FuncImm() | StrImm():
+      case LabelImm() | FuncImm() | StrImm() | PtrImm():
         raise NotImplementedError
 
       case Var():
@@ -521,7 +600,7 @@ class FuncBuilder:
         for (_, d), (_, s) in zip(dfields, sfields):
           self.copy_into(d, s)
 
-      case Var(), Var() | IntImm() | LabelImm() | FuncImm() | StrImm():
+      case Var(), Var() | IntImm() | LabelImm() | FuncImm() | StrImm() | PtrImm():
         self.emit(Copy(dst, src))
 
       case _:
@@ -546,6 +625,23 @@ class FuncBuilder:
       self.set_term(Ret(tuple(leaves(zero_val(self.ret_layout)))))
     self._check_cfg()
     return self.func
+
+
+def has_side_effects(node: object) -> bool:
+  """Whether evaluating `node` may change storage (a call does that)."""
+  if isinstance(node, syntax.Call):
+    return True
+
+  if isinstance(node, list):
+    return any(has_side_effects(item) for item in cast(list[object], node))
+
+  if isinstance(node, syntax.AST):
+    return any(
+      has_side_effects(getattr(node, name))
+      for name in getattr(node, "__dataclass_fields__", {})
+    )
+
+  return False
 
 
 class Lowering:
@@ -610,6 +706,13 @@ class Lowering:
               raise NotImplementedError  # handled in semantic
 
       case syntax.Assign(dst=dst, val=val):
+        target = self.ptr_target(dst)
+        if target is not None:
+          ptr, path, type = target
+          val_v = self.lower_expr(val)
+          self.store_ptr(ptr, path, type, val_v)
+          return
+
         dst_v = self.lower_expr(dst)
         val_v = self.lower_expr(val)
 
@@ -622,7 +725,23 @@ class Lowering:
         self.fb.copy_into(dst_v, val_v)
 
       case syntax.AugAssign(dst=dst, val=val, bop=bop_node):
+        target = self.ptr_target(dst)
+        if target is not None:
+          ptr, path, type = target
+          cur = self.load_ptr(ptr, path, type)
+          assert isinstance(cur, Var)
+          val_v = self.lower_scalar(val)
+          tmp = self.fb.temp(cur.type)
+          self.fb.emit(BinOp(tmp, cur, binaryop_of(bop_node.bop), val_v))
+          self.store_ptr(ptr, path, type, tmp)
+          return
+
         dst_v = self.lower_scalar(dst)
+        if has_side_effects(val):
+          # `x += f()`: x is read before f runs, like `x + f()`
+          kept = self.keep(dst_v, dst.type)
+          assert not isinstance(kept, Agg)
+          dst_v = kept
         val_v = self.lower_scalar(val)
 
         assert isinstance(dst_v, Var)
@@ -702,11 +821,72 @@ class Lowering:
     assert not isinstance(val, Agg)
     return val
 
+  # -- pointers ------------------------------------------------------------
+  def ptr_target(
+    self, node: syntax.Expression
+  ) -> tuple[Var, str, semantic.TypeInfo] | None:
+    """(pointer, path, type) when `node` is a dereference lvalue."""
+    path = ""
+    cur = node
+    while isinstance(cur, syntax.MemberAccess):
+      path = f".{cur.att}{path}"
+      cur = cur.src
+
+    if not isinstance(cur, syntax.Deref):
+      return None
+
+    ptr = self.lower_scalar(cur.val)
+    assert isinstance(ptr, Var) and ptr.type is ScalarType.PTR
+    return ptr, path, node.type
+
+  def load_ptr(self, ptr: Var, path: str, type: semantic.TypeInfo) -> Val:
+    """Read through a pointer, one cell per scalar leaf of `type`."""
+    return build(
+      layout_of(type),
+      lambda sub, stype: self.load_leaf(ptr, path + sub, stype),
+    )
+
+  def load_leaf(self, ptr: Var, path: str, stype: ScalarType) -> Var:
+    dst = self.fb.temp(stype)
+    self.fb.emit(LoadPtr(dst, ptr, path, stype))
+    return dst
+
+  def store_ptr(
+    self, ptr: Var, path: str, type: semantic.TypeInfo, val: Val
+  ):
+    self.store_into(ptr, path, layout_of(type), val)
+
+  def store_into(self, ptr: Var, path: str, layout: Layout, val: Val):
+    match layout, val:
+      case Aggregate(fields=fields), Agg(fields=vals):
+        for (name, lay), (_, sub) in zip(fields, vals, strict=True):
+          self.store_into(ptr, f"{path}.{name}", lay, sub)
+
+      case Scalar(type=stype), operand:
+        assert not isinstance(operand, Agg)
+        self.fb.emit(StorePtr(ptr, path, stype, operand))
+
+      case _:
+        raise RuntimeError("value shape mismatch")
+
+  def keep(self, value: Val, type: semantic.TypeInfo) -> Val:
+    """Copy a value into fresh cells so later side effects cannot change it."""
+    tmp = self.fb.fresh(layout_of(type), "t")
+    self.fb.copy_into(tmp, value)
+    return tmp
+
   def lower_expr(self, node: syntax.Expression) -> Val:
     match node:
       case syntax.BinaryExpr(lhs=lhs, rhs=rhs, bop=bop_node):
         dst_v = self.fb.temp(ScalarType.INT)
         lhs_v = self.lower_scalar(lhs)
+
+        # `g + bar()`, where bar changes g: the left operand is read first
+        if has_side_effects(rhs):
+          kept = self.keep(lhs_v, lhs.type)
+          assert not isinstance(kept, Agg)
+          lhs_v = kept
+
         rhs_v = self.lower_scalar(rhs)
         self.fb.emit(BinOp(dst_v, lhs_v, binaryop_of(bop_node.bop), rhs_v))
 
@@ -726,9 +906,18 @@ class Lowering:
         return dst
 
       case syntax.Call(src=src, args=args):
+        arg_vals: list[Val] = []
+        for i, a in enumerate(args):
+          v = self.lower_expr(a)
+          # arguments are evaluated left to right; a later call must not
+          # change what an earlier argument refers to
+          if any(has_side_effects(b) for b in args[i + 1:]):
+            v = self.keep(v, a.type)
+          arg_vals.append(v)
+
         call_args: list[Operand] = []
-        for a in args:
-          call_args.extend(leaves(self.lower_expr(a)))
+        for v in arg_vals:
+          call_args.extend(leaves(v))
 
         callee = (
           self.funcs[src.sym]
@@ -760,8 +949,34 @@ class Lowering:
         it = iter(rets)
         return build(layout_of(node.type), lambda _, __: next(it))
 
-      case syntax.Name() | syntax.MemberAccess():
+      case syntax.AddrOf(val=val):
+        target = self.ptr_target(val)
+        if target is not None:
+          # `&(p&)` is just the pointer p
+          return target[0]
+
+        if not isinstance(val, (syntax.Name, syntax.MemberAccess)):
+          raise RuntimeError("unsupported reference target")
+
+        v = self.lower_lval(val)
+        dst = self.fb.temp(ScalarType.PTR)
+        self.fb.emit(AddrOf(dst, v))
+        return dst
+
+      case syntax.Deref() | syntax.MemberAccess():
+        target = self.ptr_target(node)
+        if target is not None:
+          ptr, path, type = target
+          return self.load_ptr(ptr, path, type)
+
+        assert isinstance(node, syntax.MemberAccess)
         return self.lower_lval(node)
+
+      case syntax.Name():
+        return self.lower_lval(node)
+
+      case syntax.NullLiteral():
+        return PtrImm(NULL_PTR)
 
       case syntax.ScalarLiteral(val=v, type=type):
         layout = layout_of(type)
@@ -776,19 +991,32 @@ class Lowering:
             assert isinstance(v, utils.StrImm)
             return StrImm(v.val)
 
-          case ScalarType.FUNC | ScalarType.LABEL:
+          case ScalarType.FUNC | ScalarType.LABEL | ScalarType.PTR:
             raise NotImplementedError
 
       case syntax.TupleLiteral(elems=elems):
-        return Agg(tuple(
-          (str(i), self.lower_expr(e)) for i, e in enumerate(elems)
-        ))
+        elems_v: list[Val] = []
+        for i, e in enumerate(elems):
+          v = self.lower_expr(e)
+          if any(has_side_effects(x) for x in elems[i + 1:]):
+            v = self.keep(v, e.type)
+          elems_v.append(v)
+
+        return Agg(tuple((str(i), v) for i, v in enumerate(elems_v)))
 
       case syntax.StructLiteral(fields=fields):
-        vals = {f.name: self.lower_expr(f.val) for f in fields}
+        field_vals: dict[str, Val] = {}
+        for i, f in enumerate(fields):
+          v = self.lower_expr(f.val)
+          if any(has_side_effects(g.val) for g in fields[i + 1:]):
+            v = self.keep(v, f.val.type)
+          field_vals[f.name] = v
+
         layout = layout_of(node.type)
         assert isinstance(layout, Aggregate)
-        return Agg(tuple((name, vals[name]) for name, _ in layout.fields))
+        return Agg(
+          tuple((name, field_vals[name]) for name, _ in layout.fields)
+        )
 
   def lower_lval(self, node: syntax.Name | syntax.MemberAccess) -> Val:
     match node:

@@ -51,7 +51,44 @@ class Function:
     return f"({", ".join(str(p) for p in self.params)}) -> {self.ret_type!s}"
 
 
-TypeInfo = Prim | Struct | Tuple | Function
+@dataclass(frozen=True)
+class Ref:
+  """A pointer to a storage cell; only references can be nullable."""
+
+  inner: TypeInfo
+  nullable: bool = False
+
+  def __str__(self):
+    return f"&{self.inner!s}{'?' if self.nullable else ''}"
+
+
+@dataclass(frozen=True)
+class Null:
+  """The type of the `N` literal: assignable to any nullable reference."""
+
+  def __str__(self):
+    return "N"
+
+
+TypeInfo = Prim | Struct | Tuple | Function | Ref | Null
+
+
+def assignable(src: TypeInfo, dst: TypeInfo) -> bool:
+  """`src` may be stored where `dst` is expected.
+
+  A nullable reference accepts a plain reference (and `N`), but not the
+  other way round.
+  """
+  if src == dst:
+    return True
+
+  if isinstance(src, Null):
+    return isinstance(dst, Ref) and dst.nullable
+
+  if isinstance(src, Ref) and isinstance(dst, Ref):
+    return src.inner == dst.inner and (dst.nullable or not src.nullable)
+
+  return False
 
 
 @dataclass(eq=False)
@@ -59,6 +96,7 @@ class Symbol:
   name: str
   type: TypeInfo
   is_func: bool = False  # declared with `func`, not by a variable
+  exported: bool = False  # its scoreboard holder is `$name`, not `#name`
 
 
 class BuiltinTypes:
@@ -97,6 +135,23 @@ Attribute = Export | Dummy
 def binop_type(
   op: syntax.BinaryOpNode, lhs: TypeInfo, rhs: TypeInfo
 ) -> TypeInfo:
+  if op.bop in (syntax.BinaryOp.CEQ, syntax.BinaryOp.CNE):
+    if isinstance(lhs, Ref) and isinstance(rhs, Ref):
+      if lhs.inner != rhs.inner:
+        raise error.CompileError(
+          f"cannot compare references to {lhs.inner!s} and {rhs.inner!s}",
+          op.span,
+        )
+      return BuiltinTypes.bool
+
+    if isinstance(lhs, Null) or isinstance(rhs, Null):
+      other = rhs if isinstance(lhs, Null) else lhs
+      if not isinstance(other, Ref):
+        raise error.CompileError(
+          f"cannot compare {other!s} with N", op.span
+        )
+      return BuiltinTypes.bool
+
   match op.bop, lhs, rhs:
     case (
       syntax.BinaryOp.ADD | syntax.BinaryOp.SUB |
@@ -188,6 +243,9 @@ class Scope:
   parent: Scope | None = None
   types: dict[str, TypeInfo] = field(default_factory=dict[str, TypeInfo])
   names: dict[str, Symbol] = field(default_factory=dict[str, Symbol])
+  narrowed: dict[Symbol, TypeInfo] = field(
+    default_factory=dict[Symbol, TypeInfo]
+  )
 
   def lookup_type(self, name: str) -> TypeInfo | None:
     s = self
@@ -203,6 +261,16 @@ class Scope:
     while s is not None:
       if name in s.names:
         return s.names[name]
+      s = s.parent
+
+    return None
+
+  def lookup_narrow(self, sym: Symbol) -> TypeInfo | None:
+    """A narrowed type for `sym` (e.g. after `if (p != N)`), if any."""
+    s = self
+    while s is not None:
+      if sym in s.narrowed:
+        return s.narrowed[sym]
       s = s.parent
 
     return None
@@ -254,6 +322,54 @@ class Semantic:
       yield self.scope
     finally:
       self.scope = prev
+
+  @contextmanager
+  def with_narrowed(self, narrowed: dict[Symbol, TypeInfo]):
+    """Give some symbols a more precise type inside this block."""
+    if not narrowed:
+      yield self.scope
+      return
+
+    prev = self.scope
+    self.scope = Scope(prev)
+    self.scope.narrowed.update(narrowed)
+    try:
+      yield self.scope
+    finally:
+      self.scope = prev
+
+  def narrowing(
+    self, test: syntax.Expression
+  ) -> tuple[dict[Symbol, TypeInfo], dict[Symbol, TypeInfo]]:
+    """Types refined by `p != N` / `p == N` for each branch."""
+    none: dict[Symbol, TypeInfo] = {}
+
+    if not isinstance(test, syntax.BinaryExpr):
+      return none, none
+
+    op = test.bop.bop
+    if op not in (syntax.BinaryOp.CEQ, syntax.BinaryOp.CNE):
+      return none, none
+
+    name: syntax.Name | None = None
+    if isinstance(test.lhs, syntax.Name) and isinstance(
+      test.rhs, syntax.NullLiteral
+    ):
+      name = test.lhs
+    elif isinstance(test.rhs, syntax.Name) and isinstance(
+      test.lhs, syntax.NullLiteral
+    ):
+      name = test.rhs
+
+    if name is None:
+      return none, none
+
+    ty = self.scope.lookup_narrow(name.sym) or name.sym.type
+    if not (isinstance(ty, Ref) and ty.nullable):
+      return none, none
+
+    narrowed: dict[Symbol, TypeInfo] = {name.sym: Ref(ty.inner)}
+    return (narrowed, none) if op is syntax.BinaryOp.CNE else (none, narrowed)
 
   @contextmanager
   def with_state(
@@ -359,12 +475,16 @@ class Semantic:
         ty = self.analyze_type(type)
         if init is not None:
           self.analyze_expr(init)
-          if init.type != ty:
+          if not assignable(init.type, ty):
             raise error.CompileError(
               f"type {init.type!s} is not assignable to declared type {ty!s}",
               init.span
             )
         sym = Symbol(name, ty)
+        for attr in node.attrs:
+          if isinstance(attr, Export):
+            sym.exported = True
+
         node.set_symbol(sym)
         self.scope.declare_name(name, sym, name_tok.span)
 
@@ -386,7 +506,7 @@ class Semantic:
 
         dst_ty, val_ty = dst.type, val.type
         
-        if dst_ty != val_ty:
+        if not assignable(val_ty, dst_ty):
           raise error.CompileError(
             f"type {val_ty!s} is not assignable to declared type {dst_ty!s}",
             span
@@ -461,9 +581,14 @@ class Semantic:
             test.span
           )
 
-        self.analyze_stmt(body)
+        then_narrow, else_narrow = self.narrowing(test)
+
+        with self.with_narrowed(then_narrow):
+          self.analyze_stmt(body)
+
         if orelse is not None:
-          self.analyze_stmt(orelse)
+          with self.with_narrowed(else_narrow):
+            self.analyze_stmt(orelse)
 
       case syntax.Pass():
         self.check_attrs(node, set())
@@ -482,10 +607,13 @@ class Semantic:
           val_ty = val.type
           val_span = val.span
 
-        if val_ty != self.return_type:
+        ret_type = self.return_type
+        assert ret_type is not None
+
+        if not assignable(val_ty, ret_type):
           raise error.CompileError(
             f"type {val_ty} is not assignable to declared return type "
-            + str(self.return_type), val_span
+            + str(ret_type), val_span
           )
 
       case syntax.While(test=test, body=body):
@@ -522,7 +650,59 @@ class Semantic:
           raise error.CompileError(f"undeclared name {name!r}", span)
 
         node.set_symbol(sym)
-        node.set_typeinfo(sym.type, True)
+        narrowed = self.scope.lookup_narrow(sym)
+        node.set_typeinfo(narrowed or sym.type, True)
+
+      case syntax.AddrOf(val=val, span=span):
+        self.analyze_expr(val)
+
+        if isinstance(val, syntax.Name) and val.sym.is_func:
+          raise error.CompileError(
+            "cannot take a reference to a function", span
+          )
+
+        if not val.lval:
+          raise error.CompileError(
+            "cannot take a reference to a value (only lvalues have an address)",
+            val.span
+          )
+
+        root = val
+        while isinstance(root, syntax.MemberAccess):
+          root = root.src
+
+        if (
+          isinstance(root, syntax.Name)
+          and root.sym.exported
+        ):
+          raise error.CompileError(
+            "cannot take a reference to an exported variable: its scoreboard "
+            "holder is named '$name', but a pointer only carries the plain "
+            "name", span
+          )
+
+        node.set_typeinfo(Ref(val.type), True)
+
+      case syntax.Deref(val=val, span=span):
+        self.analyze_expr(val)
+
+        match val.type:
+          case Ref(inner=inner, nullable=True):
+            raise error.CompileError(
+              "cannot dereference a nullable reference; compare it with N "
+              "first (if (p != N) { ... })", span
+            )
+
+          case Ref(inner=inner):
+            node.set_typeinfo(inner, True)
+
+          case _ as ty:
+            raise error.CompileError(
+              f"type {ty!s} is not a reference", span
+            )
+
+      case syntax.NullLiteral():
+        node.set_typeinfo(Null(), False)
 
       case syntax.MemberAccess(src=src, att=att, span=span):
         self.analyze_expr(src)
@@ -537,6 +717,15 @@ class Semantic:
             if att not in fields:
               raise error.CompileError(f"undeclared field name: {att!r}", span)
             node.set_typeinfo(fields[att], src.lval)
+
+          case Ref():
+            raise error.CompileError(
+              f"cannot read field {att!r} through a reference; dereference it "
+              "first (p&." + att + ")", span
+            )
+
+          case Null():
+            raise error.CompileError("N has no fields", span)
         
           case _ as ty:
             raise error.CompileError(f"type {ty!s} has no fields", span)
@@ -553,7 +742,12 @@ class Semantic:
           self.analyze_expr(arg)
           arg_types.append(arg.type)
 
-        if arg_types != src.type.params:
+        if (
+          len(arg_types) != len(src.type.params)
+          or not all(
+            assignable(a, p) for a, p in zip(arg_types, src.type.params)
+          )
+        ):
           raise error.CompileError(
             f"argument type(s) ({", ".join(str(t) for t in arg_types)}) "
             f"are not assignable to declared type(s) ("
@@ -597,7 +791,7 @@ class Semantic:
           if f.name in seen:
             raise error.CompileError(f"duplicate field {f.name!r}", f.span)
 
-          if f.val.type != ty.fields[f.name]:
+          if not assignable(f.val.type, ty.fields[f.name]):
             raise error.CompileError(
               f"type {f.val.type!s} is not assignable to field type "
               f"{ty.fields[f.name]!s}", f.val.span
@@ -629,6 +823,17 @@ class Semantic:
           [self.analyze_type(p) for p in params],
           self.analyze_type(ret_type)
         )
+
+      case syntax.RefType(inner=inner):
+        return Ref(self.analyze_type(inner))
+
+      case syntax.NullableType(inner=inner, span=span):
+        inner_ty = self.analyze_type(inner)
+        if not isinstance(inner_ty, Ref):
+          raise error.CompileError(
+            "only references can be nullable", span
+          )
+        return Ref(inner_ty.inner, nullable=True)
 
   def analyze_attr(self, node: syntax.ParsedAttr) -> Attribute:
     match node.name:

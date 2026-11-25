@@ -15,6 +15,9 @@ Target: **Minecraft JE 1.21+** (`pack_format` 48 by default).
 - Functions with parameters and return values
 - Function values: assign, pass, return and call them indirectly (each target
   cell gets a macro trampoline, no candidate scan)
+- References: `&lvalue`, dereference with a postfix `&` (`p&.x`), nullable
+  pointers (`&T?`, `N`), pointer comparison; a pointer is a cell name, so it
+  costs one macro dispatch per access
 - Control flow: `if` / `else`, `while`, `break`, `continue`, `return`
 - Arithmetic, comparison and logical operators
 - Variable declarations, assignment and compound assignment (`+=`, `-=`, …)
@@ -27,7 +30,6 @@ Target: **Minecraft JE 1.21+** (`pack_format` 48 by default).
 ### Explicitly **not** supported yet
 
 - Recursion
-- Pointers / references
 - Arrays / lists
 - Raw Minecraft commands (`say`, `execute as …`, entity/block NBT, etc.)
 - Macros / compile-time evaluation beyond constant folding
@@ -193,7 +195,6 @@ cmdium/
 Planned (rough order):
 
 - [ ] Recursion / call stack
-- [ ] Pointers / references
 - [ ] Arrays / dynamic collections
 - [ ] Ability to emit raw Minecraft commands / interact with entities & blocks
 - [ ] Better standard library (math, string helpers, …)

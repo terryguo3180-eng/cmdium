@@ -19,7 +19,8 @@ def store_of(type: lowering.ScalarType) -> Store:
     case (
       lowering.ScalarType.STR |
       lowering.ScalarType.LABEL |
-      lowering.ScalarType.FUNC
+      lowering.ScalarType.FUNC |
+      lowering.ScalarType.PTR
     ):
       return Store.NBT
 

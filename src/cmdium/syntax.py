@@ -36,7 +36,7 @@ class Token:
 
 keywords = {
   "type", "struct", "func", "if", "else", "while", "break", "continue",
-  "return", "T", "F",
+  "return", "T", "F", "N",
 }
 
 tokens_pat = re.compile(r"""
@@ -46,7 +46,7 @@ tokens_pat = re.compile(r"""
   | (?P<NAME> \w+)
   | (?P<OP>   \+= | -= | \*= | /= | %= | <= | >= | == | != | -> | := |
               \+ | - | \* | / | % | @ | & | \| | = | ! | : | ; | \. | , |
-              < | > | \( | \) | \[ | \] | \{ | \} )
+              < | > | \( | \) | \[ | \] | \{ | \} | \? )
 """, re.X)
 
 
@@ -347,6 +347,25 @@ class UnaryExpr(ExpressionBase):
 
 
 @dataclass
+class AddrOf(ExpressionBase):
+  """`&lvalue` — the address of a storage cell."""
+
+  val: Expression
+
+
+@dataclass
+class Deref(ExpressionBase):
+  """`p&` — the value a pointer refers to."""
+
+  val: Expression
+
+
+@dataclass
+class NullLiteral(ExpressionBase):
+  """`N` — the null pointer."""
+
+
+@dataclass
 class Name(ExpressionBase):
   name: str
 
@@ -426,6 +445,16 @@ class FuncType(TypeExprBase):
   ret_type: TypeExpr
 
 
+@dataclass
+class RefType(TypeExprBase):
+  inner: TypeExpr
+
+
+@dataclass
+class NullableType(TypeExprBase):
+  inner: TypeExpr
+
+
 Declaration = VarDecl | TypeDecl | StructDecl | FuncDecl
 RawStatement = (
   If | While | Block | Break | Continue | Return | Pass | Assign | AugAssign |
@@ -433,10 +462,10 @@ RawStatement = (
 )
 Statement = Declaration | RawStatement
 Expression = (
-  BinaryExpr | UnaryExpr | Name | MemberAccess | Call | ScalarLiteral |
-  TupleLiteral | StructLiteral
+  BinaryExpr | UnaryExpr | AddrOf | Deref | Name | MemberAccess | Call |
+  ScalarLiteral | NullLiteral | TupleLiteral | StructLiteral
 )
-TypeExpr = NamedType | FuncType | TupleType
+TypeExpr = NamedType | FuncType | TupleType | RefType | NullableType
 
 
 class Parser:
@@ -807,11 +836,29 @@ class Parser:
     )
 
   def parse_type(self) -> TypeExpr | None:
-    # type : NAME
-    #      | "func" ~ "(" (type ("," type)* ","?)? ")" "->" type
-    #      | "(" (type ("," type)* ","?)? ~ ")"
+    # type : type_atom "?"*
+    spos = self.curr_spos()
+
+    type = self.parse_type_atom()
+    if type is None:
+      return None
+
+    while self.accept(TokenKind.OP, "?"):
+      type = NullableType(type).write_span(self.file, spos, self.prev_epos())
+
+    return type
+
+  def parse_type_atom(self) -> TypeExpr | None:
+    # type_atom : "&" ~ type_atom
+    #           | NAME
+    #           | "func" ~ "(" (type ("," type)* ","?)? ")" "->" type
+    #           | "(" (type ("," type)* ","?)? ~ ")"
 
     spos = self.curr_spos()
+
+    if self.accept(TokenKind.OP, "&"):
+      inner = self.expect_rule("type expression", self.parse_type_atom)
+      return RefType(inner).write_span(self.file, spos, self.prev_epos())
 
     if name := self.accept(TokenKind.NAME):
       return NamedType(name.text).write_span(
@@ -960,7 +1007,7 @@ class Parser:
     return lhs
 
   def parse_unary(self) -> Expression | None:
-    # unary : ("-" | "!") ~ unary
+    # unary : ("-" | "!" | "&") ~ unary
     #       | primary
     spos = self.curr_spos()
 
@@ -974,13 +1021,26 @@ class Parser:
       uop = UnaryOpNode(UnaryOp.NOT).write_span(*op.span)
       return UnaryExpr(uop, val).write_span(self.file, spos, self.prev_epos())
 
+    if self.accept(TokenKind.OP, "&"):
+      val = self.expect_rule("unary expression", self.parse_unary)
+      return AddrOf(val).write_span(self.file, spos, self.prev_epos())
+
     if primary := self.parse_primary():
       return primary
 
     return None
 
+  def token_starts_expr(self, tok: Token) -> bool:
+    if tok.kind in (TokenKind.NAME, TokenKind.INT, TokenKind.STR):
+      return True
+
+    if tok.kind is TokenKind.KW and tok.text in ("T", "F", "N"):
+      return True
+
+    return tok.kind is TokenKind.OP and tok.text in ("(", "-", "!", "&")
+
   def parse_primary(self) -> Expression | None:
-    # primary : atom ("." ~ (NAME | INT) | "(" args? ~ ")")*
+    # primary : atom ("." ~ (NAME | INT) | "(" args? ~ ")" | "&")*
     spos = self.curr_spos()
     if not (val := self.parse_atom()):
       return None
@@ -1001,6 +1061,15 @@ class Parser:
           "')'" if args else "arguments or ')'", TokenKind.OP, ")"
         )
         val = Call(val, args).write_span(self.file, spos, self.prev_epos())
+      elif (
+        (tok := self.current_tok()).kind is TokenKind.OP
+        and tok.text == "&"
+        and not self.token_starts_expr(self.toks[self.pos + 1])
+      ):
+        # a postfix `&` (dereference) can be told apart from binary `&` by
+        # what follows it: `x & y` continues an expression, `x&` does not
+        self.pos += 1
+        val = Deref(val).write_span(self.file, spos, self.prev_epos())
       else:
         return val
 
@@ -1081,6 +1150,9 @@ class Parser:
       return ScalarLiteral(imm).write_span(
         self.file, spos, self.prev_epos()
       )
+
+    if tok := self.accept(TokenKind.KW, "N"):
+      return NullLiteral().write_span(self.file, spos, self.prev_epos())
 
     mark = self.tell()
     if self.accept(TokenKind.OP, "("):
