@@ -59,7 +59,11 @@ class Ref:
   nullable: bool = False
 
   def __str__(self):
-    return f"&{self.inner!s}{'?' if self.nullable else ''}"
+    inner = str(self.inner)
+    if isinstance(self.inner, Ref) and self.inner.nullable:
+      # without the parentheses the text would mean a nullable outer pointer
+      inner = f"({inner})"
+    return f"&{inner}{'?' if self.nullable else ''}"
 
 
 @dataclass(frozen=True)
@@ -472,14 +476,20 @@ class Semantic:
       ):
         self.check_attrs(node, {Export})
 
-        ty = self.analyze_type(type)
-        if init is not None:
+        if type is None:
+          assert init is not None
           self.analyze_expr(init)
-          if not assignable(init.type, ty):
-            raise error.CompileError(
-              f"type {init.type!s} is not assignable to declared type {ty!s}",
-              init.span
-            )
+          ty = init.type
+        else:
+          ty = self.analyze_type(type)
+          if init is not None:
+            self.analyze_expr(init)
+            if not assignable(init.type, ty):
+              raise error.CompileError(
+                f"type {init.type!s} is not assignable to declared type {ty!s}",
+                init.span
+              )
+        
         sym = Symbol(name, ty)
         for attr in node.attrs:
           if isinstance(attr, Export):
@@ -748,13 +758,36 @@ class Semantic:
             assignable(a, p) for a, p in zip(arg_types, src.type.params)
           )
         ):
+          plural = len(arg_types) != 1
           raise error.CompileError(
-            f"argument type(s) ({", ".join(str(t) for t in arg_types)}) "
-            f"are not assignable to declared type(s) ("
+            f"argument type{'s'[:plural]} "
+            f"({", ".join(str(t) for t in arg_types)}) "
+            f"{('is', 'are')[plural]} not assignable to declared "
+            f"type{'s'[:len(src.type.params) != 1]} ("
             + ", ".join(str(t) for t in src.type.params) + ")", span
           )
 
         node.set_typeinfo(src.type.ret_type, False)
+
+      case syntax.IntrinsicCall(
+        name=name, args=args, name_tok=tok, span=span
+      ):
+        if name != "cmd":
+          raise error.CompileError(f"unknown intrinsic: ${name}", tok.span)
+
+        if len(args) != 1:
+          raise error.CompileError(
+            "$cmd takes exactly one str argument", span
+          )
+
+        arg = args[0]
+        self.analyze_expr(arg)
+        if arg.type != BuiltinTypes.str:
+          raise error.CompileError(
+            f"$cmd takes a str, got {arg.type!s}", arg.span
+          )
+
+        node.set_typeinfo(BuiltinTypes.void, False)
 
       case syntax.ScalarLiteral(val=val, span=span):
         match val:
@@ -801,7 +834,7 @@ class Semantic:
 
         if missing := ty.fields.keys() - seen:
           raise error.CompileError(
-            f"missing field(s): {sorted(missing)}", span
+            f"missing field{'s'[:len(missing) != 1]}: {sorted(missing)}", span
           )
 
         node.set_typeinfo(ty, False)
@@ -832,6 +865,11 @@ class Semantic:
         if not isinstance(inner_ty, Ref):
           raise error.CompileError(
             "only references can be nullable", span
+          )
+        if inner_ty.nullable:
+          raise error.CompileError(
+            "type is already nullable; write &(&T?)? for a nullable pointer "
+            "to a nullable pointer", span
           )
         return Ref(inner_ty.inner, nullable=True)
 

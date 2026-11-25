@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
   if args.emit == "mcfunction":
     for name, fn in mc_funcs.items():
       print(f"# {name}.mcfunction")
-      for cmd in fn.cmds:
+      for cmd in "\n".join(fn.cmds).split("\n"):
         print(f"  {cmd}")
       print()
     return 0

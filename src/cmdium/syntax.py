@@ -46,7 +46,7 @@ tokens_pat = re.compile(r"""
   | (?P<NAME> \w+)
   | (?P<OP>   \+= | -= | \*= | /= | %= | <= | >= | == | != | -> | := |
               \+ | - | \* | / | % | @ | & | \| | = | ! | : | ; | \. | , |
-              < | > | \( | \) | \[ | \] | \{ | \} | \? )
+              < | > | \( | \) | \[ | \] | \{ | \} | \? | \$ )
 """, re.X)
 
 
@@ -185,7 +185,7 @@ class DeclarationBase(StatementBase):
 @dataclass
 class VarDecl(DeclarationBase):
   name: str
-  type: TypeExpr
+  type: TypeExpr | None  # None: auto inference
   init: Expression | None
   name_tok: Token
 
@@ -387,6 +387,15 @@ class Call(ExpressionBase):
   args: list[Expression]
 
 
+@dataclass
+class IntrinsicCall(ExpressionBase):
+  """`$name(args)` — a compiler-provided operation, not a program function."""
+
+  name: str
+  args: list[Expression]
+  name_tok: Token
+
+
 class ScalarKind(utils.DataEnum):
   I32 = auto()
   BOOL = auto()
@@ -463,7 +472,7 @@ RawStatement = (
 Statement = Declaration | RawStatement
 Expression = (
   BinaryExpr | UnaryExpr | AddrOf | Deref | Name | MemberAccess | Call |
-  ScalarLiteral | NullLiteral | TupleLiteral | StructLiteral
+  IntrinsicCall | ScalarLiteral | NullLiteral | TupleLiteral | StructLiteral
 )
 TypeExpr = NamedType | FuncType | TupleType | RefType | NullableType
 
@@ -726,27 +735,34 @@ class Parser:
 
   def parse_var_decl(self) -> VarDecl | None:
     # var_decl : NAME ":" ~ type ("=" expr)? ";"
+    #          | NAME ":=" expr ";"
     mark = self.tell()
     spos = self.curr_spos()
 
-    if (
-      (name := self.accept(TokenKind.NAME))
-      and self.accept(TokenKind.OP, ":")
-    ):
-      type = self.expect_rule("type expression", self.parse_type)
-        
-      if self.accept(TokenKind.OP, "="):
+    if (name := self.accept(TokenKind.NAME)):
+      if self.accept(TokenKind.OP, ":"):
+        type = self.expect_rule("type expression", self.parse_type)
+          
+        if self.accept(TokenKind.OP, "="):
+          init = self.expect_rule("expression", self.parse_expr)
+          sm_msg = "expr or ';'"
+        else:
+          init = None
+          sm_msg = "';'"
+
+        self.expect(sm_msg, TokenKind.OP, ";")
+
+        return VarDecl(name.text, type, init, name).write_span(
+          self.file, spos, self.prev_epos()
+        )
+      
+      elif self.accept(TokenKind.OP, ":="):
         init = self.expect_rule("expression", self.parse_expr)
-        sm_msg = "expr or ';'"
-      else:
-        init = None
-        sm_msg = "';'"
+        self.expect("';'", TokenKind.OP, ";")
 
-      self.expect(sm_msg, TokenKind.OP, ";")
-
-      return VarDecl(name.text, type, init, name).write_span(
-        self.file, spos, self.prev_epos()
-      )
+        return VarDecl(name.text, None, init, name).write_span(
+          self.file, spos, self.prev_epos()
+        )
 
     self.seek(mark)
     return None
@@ -1097,13 +1113,25 @@ class Parser:
     return None
 
   def parse_atom(self) -> Expression | None:
-    # atom : NAME "{" (field_init ("," field_init)* ","?)? ~ "}"
+    # atom : "$" NAME "(" args? ~ ")"
+    #      | NAME "{" (field_init ("," field_init)* ","?)? ~ "}"
     #      | INT
     #      | STR
-    #      | "T" | "F"
+    #      | "T" | "F" | "N"
     #      | "( (expr ("," expr)* ","?)? ~ )"
 
     spos = self.curr_spos()
+
+    if self.accept(TokenKind.OP, "$"):
+      name = self.expect("intrinsic name", TokenKind.NAME)
+      self.expect("'('", TokenKind.OP, "(")
+      args = self.parse_args() or []
+      self.expect(
+        "')'" if args else "arguments or ')'", TokenKind.OP, ")"
+      )
+      return IntrinsicCall(name.text, args, name).write_span(
+        self.file, spos, self.prev_epos()
+      )
 
     if name := self.accept(TokenKind.NAME):
       if not self.accept(TokenKind.OP, "{"):

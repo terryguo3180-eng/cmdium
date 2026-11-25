@@ -18,6 +18,8 @@ Target: **Minecraft JE 1.21+** (`pack_format` 48 by default).
 - References: `&lvalue`, dereference with a postfix `&` (`p&.x`), nullable
   pointers (`&T?`, `N`), pointer comparison; a pointer is a cell name, so it
   costs one macro dispatch per access
+- Intrinsics: `$name(args)`, currently `$cmd(str)`: a constant string is
+  inlined verbatim, a runtime string is expanded into a `$$(cell)` macro line
 - Control flow: `if` / `else`, `while`, `break`, `continue`, `return`
 - Arithmetic, comparison and logical operators
 - Variable declarations, assignment and compound assignment (`+=`, `-=`, …)
@@ -31,7 +33,8 @@ Target: **Minecraft JE 1.21+** (`pack_format` 48 by default).
 
 - Recursion
 - Arrays / lists
-- Raw Minecraft commands (`say`, `execute as …`, entity/block NBT, etc.)
+- Typed access to raw commands: `$cmd("…")` inlines a string, but nothing
+  type-checks it, and entities/blocks have no API of their own
 - Macros / compile-time evaluation beyond constant folding
 - Modules / multiple files
 
@@ -194,27 +197,18 @@ cmdium/
 
 Planned (rough order):
 
-- [ ] Recursion / call stack
+- [ ] Recursion: build a call graph, then pack the live locals of each
+      strongly connected component into one frame per call depth
 - [ ] Arrays / dynamic collections
-- [ ] Ability to emit raw Minecraft commands / interact with entities & blocks
+- [ ] Floats: scoreboard soft-float, or the newer `compute` command
+- [ ] String operations (concat, slice, compare, …)
+- [ ] Typed API for entities & blocks (beyond `$cmd` strings)
 - [ ] Better standard library (math, string helpers, …)
 - [ ] Multi-file projects / modules
 - [ ] Source maps / better diagnostics
 - [ ] More aggressive optimisations
 
 Contributions and ideas are welcome once the core stabilises.
-
----
-
-## Performance
-
-Command costs were measured on a real server, in-chain with `/stopwatch`:
-a `function` call is ~90 ns of overhead, a scoreboard operation ~100 ns,
-a macro dispatch ~260 ns on a cache hit and ~700 ns on a miss, and a deep call
-chain costs the same per level at depth 200 and depth 20 000.
-
-See [docs/performance.md](docs/performance.md) for the tables, the measurement
-method, and the codegen decisions they justify.
 
 ---
 

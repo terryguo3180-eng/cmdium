@@ -308,6 +308,13 @@ class DatapackGen:
       self._deref_tmp[store] = slot
     return slot
 
+  def gen_raw_macro(self, fg: FuncGen, src: lowering.Var):
+    """`$cmd(<str value>)`: expand the cell into a command at run time."""
+    key = self.deref_key(fg, self.slots.of_var(src))
+    body = self.abi.raw_macro(key)
+    name = self.deref_trampoline((key, "", Store.NBT, "raw"), body)
+    fg.emit(self.abi.macro_call(name))
+
   def deref_trampoline(self, key: DerefKey, body: str) -> str:
     name = self._derefs.get(key)
     if name is None:
@@ -408,6 +415,12 @@ class DatapackGen:
 
       case lowering.StorePtr(ptr=ptr, path=path, type=type, src=src):
         self.gen_store_ptr(fg, ptr, path, type, src)
+
+      case lowering.Raw(cmd=cmd):
+        fg.emit(cmd)
+
+      case lowering.RawMacro(src=src):
+        self.gen_raw_macro(fg, src)
 
   def gen_call(
     self,

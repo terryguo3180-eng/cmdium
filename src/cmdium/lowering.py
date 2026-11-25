@@ -431,7 +431,33 @@ class StorePtr:
     return f"{self.ptr!s}&{self.path} = {self.src!s}"
 
 
-IR = Copy | BinOp | Call | IndirectCall | AddrOf | LoadPtr | StorePtr
+@dataclass
+class Raw:
+  """An opaque Minecraft command, inlined verbatim (`$cmd`)."""
+
+  cmd: str
+
+  def __str__(self):
+    return self.cmd
+
+
+@dataclass
+class RawMacro:
+  """A command string built at run time: expand a cell into a macro line."""
+
+  src: Var
+
+  def __post_init__(self):
+    assert self.src.type == ScalarType.STR
+
+  def __str__(self):
+    return f"$cmd({self.src!s})"
+
+
+IR = (
+  Copy | BinOp | Call | IndirectCall | AddrOf | LoadPtr | StorePtr |
+  Raw | RawMacro
+)
 Terminator = Jump | IndirectJump | Branch | Ret
 
 
@@ -977,6 +1003,22 @@ class Lowering:
 
       case syntax.NullLiteral():
         return PtrImm(NULL_PTR)
+
+      case syntax.IntrinsicCall(name=name, args=args):
+        if name != "cmd":
+          raise RuntimeError(f"unknown intrinsic ${name}")
+
+        match args[0]:
+          case syntax.ScalarLiteral(val=utils.StrImm(val=text)):
+            # a constant string is simply inlined
+            self.fb.emit(Raw(text))
+
+          case _:
+            src = self.lower_scalar(args[0])
+            assert isinstance(src, Var)
+            self.fb.emit(RawMacro(src))
+
+        return Agg(())
 
       case syntax.ScalarLiteral(val=v, type=type):
         layout = layout_of(type)

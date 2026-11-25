@@ -242,6 +242,14 @@ class ABI:
     """Call a macro function: the slot container provides its arguments."""
     return f"function {self.func_name(block)} with {self.container()}"
 
+  def raw_macro(self, key: str) -> str:
+    """A line that expands the command string held in a cell.
+
+    The leading `$` marks the line as a macro line, the rest is the
+    substitution, so the whole line becomes whatever the cell contains.
+    """
+    return f"$$({key})"
+
   # A function value is a macro argument: one trampoline per storage cell
   # expands to a call of whatever name that cell holds.  The cell's data path
   # doubles as the macro variable name.
