@@ -6,6 +6,10 @@ from cmdium import lowering
 
 
 def fold(bop: lowering.BinaryOp, a: int, b: int) -> int | None:
+  # `/=` is floor division and `%=` is the positive remainder in Minecraft
+  # (verified on a 1.21.1 server), which is exactly Python's `//` and `%`.
+  # For a zero divisor the command fails and leaves the target unchanged, so
+  # there is nothing to fold; the front end rejects constant zero divisors.
   match bop:
     case lowering.BinaryOp.ADD: r = a + b
     case lowering.BinaryOp.SUB: r = a - b
@@ -71,7 +75,9 @@ def merge_blocks(func: lowering.IRFunc) -> None:
       return
 
 
-def local_opt(block: lowering.BasicBlock) -> None:
+def local_opt(
+  block: lowering.BasicBlock, exported: set[lowering.Var]
+) -> None:
   env: dict[lowering.Var, lowering.Operand] = {}
 
   def sub(op: lowering.Operand) -> lowering.Operand:
@@ -84,7 +90,9 @@ def local_opt(block: lowering.BasicBlock) -> None:
 
   def invalidate_for_call() -> None:
     for k, v in list(env.items()):
-      stable = not (k.export or (isinstance(v, lowering.Var) and v.export))
+      stable = not (
+        k in exported or (isinstance(v, lowering.Var) and v in exported)
+      )
       if not stable:
         del env[k]
 
@@ -177,12 +185,12 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
         match inst:
           case (
             lowering.Copy(dst=d) | lowering.BinOp(dst=d)
-          ) if not (d.export or d in used):
+          ) if not (d in func.exports or d in used):
             changed = True
           case lowering.Call(callee=callee, args=args, rets=rets):
             new_rets: list[lowering.Var | None] = []
             for r in rets:
-              if not (r is None or r.export or r in used):
+              if not (r is None or r in func.exports or r in used):
                 changed = True
                 r = None
               new_rets.append(r)
@@ -196,12 +204,13 @@ def remove_dead_temps(func: lowering.IRFunc) -> None:
 
 
 def optimize(func: lowering.IRFunc) -> None:
+  exported = set(func.exports)
   while True:
     before = str(func)
     prune_unreachable(func)
     merge_blocks(func)
     for b in func.blocks:
-      local_opt(b)
+      local_opt(b, exported)
     remove_dead_temps(func)
     if str(func) == before:
       return

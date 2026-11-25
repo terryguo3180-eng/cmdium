@@ -135,12 +135,16 @@ class Scoreboard:
       case ScoreOp.SET | ScoreOp.ADD | ScoreOp.SUB as sop if (
         isinstance(self.src, ScoreImm)
       ):
-        op = {
-          ScoreOp.SET: "set", ScoreOp.ADD: "add", ScoreOp.SUB: "remove"
-        }[sop]
-        if self.src.val < 0 and op != "set":
-          op = ("add", "remove")[op == "add"]
-        val = abs(self.src.val)
+        # `set` keeps the sign of the value; `add`/`remove` take the absolute
+        # value and flip the operation for a negative source.
+        if sop is ScoreOp.SET:
+          op, val = "set", self.src.val
+        elif sop is ScoreOp.ADD:
+          op = "add" if self.src.val >= 0 else "remove"
+          val = abs(self.src.val)
+        else:  # SUB
+          op = "remove" if self.src.val >= 0 else "add"
+          val = abs(self.src.val)
 
         return f"{prefix}scoreboard players {op} {self.dst!s} {val}"
 
@@ -426,9 +430,15 @@ def _classify(bop: lowering.BinaryOp) -> ScoreOp | CompareOp:
 
 
 class Names:
-  def __init__(self, objective: str, stg: Storage):
+  def __init__(
+    self,
+    objective: str,
+    stg: Storage,
+    exports: dict[lowering.Var, str],
+  ):
     self.objective = objective
     self.stg = stg
+    self.exports = exports
     self.counts: dict[str, int] = {}
     self.vars: dict[lowering.Var, CommandVar] = {}
     self.rets: dict[tuple[lowering.IRFunc, int], CommandVar] = {}
@@ -460,7 +470,9 @@ class Names:
 
   def get(self, var: lowering.Var) -> CommandVar:
     if var not in self.vars:
-      self.vars[var] = self.make(var.type, var.hint, var.export)
+      export_name = self.exports.get(var)
+      hint = var.hint if export_name is None else export_name
+      self.vars[var] = self.make(var.type, hint, export_name is not None)
     return self.vars[var]
 
   def get_ret(self, func: lowering.IRFunc, i: int) -> CommandVar:
@@ -701,7 +713,12 @@ class DatapackGen:
     self.objective = ns
     self.setup_func = ".setup"
     self.consts: set[int] = set()
-    self.names = Names(self.objective, self.stg)
+
+    # vars are unique objects, so the per-function tables can be merged
+    exports: dict[lowering.Var, str] = {}
+    for func in ir_funcs:
+      exports.update(func.exports)
+    self.names = Names(self.objective, self.stg, exports)
 
     self.funcs: dict[str, MCFunction] = {}
     self.fb: MCFuncBuilder = None  # type: ignore

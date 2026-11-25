@@ -4,7 +4,7 @@ import json
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import auto
 
 from cmdium import semantic
@@ -61,7 +61,6 @@ class Var:
   type: ScalarType
   hint: str
   id: int
-  export: bool = False
 
   def __str__(self):
     return f"%{self.hint}.{self.id}"
@@ -275,6 +274,8 @@ class IRFunc:
   params: list[Var]
   ret_types: list[ScalarType]
   blocks: list[BasicBlock]
+  # vars that are exposed outside the program, mapped to their public name
+  exports: dict[Var, str] = field(default_factory=dict[Var, str])
 
   @property
   def entry(self) -> BasicBlock:
@@ -283,6 +284,8 @@ class IRFunc:
   def __str__(self):
     params = ", ".join(str(p) for p in self.params)
     s = f"func {self.name}({params}) {{\n"
+    for var, name in self.exports.items():
+      s += f"  export {var!s} as {name}\n"
     for inst in self.blocks:
       for line in str(inst).split("\n"):
         s += "  " + str(line) + "\n"
@@ -447,17 +450,32 @@ class FuncBuilder:
   def continue_block(self):
     return self.continue_stack[-1]
 
-  def new_var(self, type: ScalarType, hint: str, export: bool = False) -> Var:
+  def new_var(self, type: ScalarType, hint: str) -> Var:
     self.n_vars += 1
-    return Var(type, hint, self.n_vars, export)
+    return Var(type, hint, self.n_vars)
 
   def temp(self, type: ScalarType) -> Var:
     return self.new_var(type, "t")
 
-  def fresh(self, layout: Layout, hint: str, export: bool = False) -> Val:
-    return build(
-      layout, lambda path, type: self.new_var(type, hint + path, export)
-    )
+  def fresh(self, layout: Layout, hint: str) -> Val:
+    return build(layout, lambda path, type: self.new_var(type, hint + path))
+
+  def export(self, layout: Layout, val: Val, name: str) -> None:
+    """Expose every scalar leaf of `val` under `name`.
+
+    Aggregate fields get a dotted suffix (e.g. ``q.p.x``), matching the paths
+    built by `fresh`.
+    """
+    match layout, val:
+      case Aggregate(fields=fields), Agg(fields=vals):
+        for (fname, lay), (_, sub) in zip(fields, vals, strict=True):
+          self.export(lay, sub, f"{name}.{fname}")
+
+      case Scalar(), Var() as var:
+        self.func.exports[var] = name
+
+      case _:
+        raise RuntimeError("value shape mismatch")
 
   def copy_into(self, dst: Val, src: Val):
     match dst, src:
@@ -542,20 +560,17 @@ class Lowering:
         else:
           ival = self.lower_expr(init)
 
-        export = False
+        dst = self.fb.fresh(layout, name)
+        self.sym_vals[sym] = dst
+        self.fb.copy_into(dst, ival)
 
         for attr in attrs:
           match attr:
             case semantic.Export(hint=hint):
-              export = True
-              name = hint or name
+              self.fb.export(layout, dst, hint or name)
 
             case _:
               raise NotImplementedError  # handled in semantic
-
-        dst = self.fb.fresh(layout, name, export)
-        self.sym_vals[sym] = dst
-        self.fb.copy_into(dst, ival)
 
       case syntax.Assign(dst=dst, val=val):
         dst_v = self.lower_expr(dst)
@@ -563,7 +578,7 @@ class Lowering:
 
         # the elements may read dst, e.g. `t = (t.1, t.0);`
         if isinstance(val, (syntax.TupleLiteral, syntax.StructLiteral)):
-          tmp = self.fb.fresh(layout_of(val.type), "t", export=False)
+          tmp = self.fb.fresh(layout_of(val.type), "t")
           self.fb.copy_into(tmp, val_v)
           val_v = tmp
 

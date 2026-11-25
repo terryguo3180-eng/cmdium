@@ -150,6 +150,38 @@ def unaop_type(op: syntax.UnaryOpNode, val: TypeInfo) -> TypeInfo:
       )
 
 
+def literal_int(node: syntax.Expression) -> int | None:
+  """Value of an integer literal, including a negated one; None otherwise."""
+  match node:
+    case syntax.ScalarLiteral(val=utils.IntImm(val=val)):
+      return val
+
+    case syntax.UnaryExpr(
+      uop=syntax.UnaryOpNode(uop=syntax.UnaryOp.NEG), val=inner
+    ):
+      val = literal_int(inner)
+      return None if val is None else -val
+
+    case _:
+      return None
+
+
+def check_divisor(op: syntax.BinaryOpNode, rhs: syntax.Expression) -> None:
+  """Reject a constant zero divisor.
+
+  `/=` and `%=` fail at runtime when the divisor is 0 (verified on 1.21.1),
+  which would silently leave the destination unchanged.
+  """
+  if op.bop not in (syntax.BinaryOp.DIV, syntax.BinaryOp.MOD):
+    return
+
+  if literal_int(rhs) != 0:
+    return
+
+  what = "division" if op.bop is syntax.BinaryOp.DIV else "modulo"
+  raise error.CompileError(f"{what} by zero", rhs.span)
+
+
 @dataclass
 class Scope:
   parent: Scope | None = None
@@ -470,6 +502,7 @@ class Semantic:
         self.analyze_expr(lhs)
         self.analyze_expr(rhs)
         dst_ty = binop_type(bop, lhs.type, rhs.type)
+        check_divisor(bop, rhs)
         node.set_typeinfo(dst_ty, False)
 
       case syntax.UnaryExpr(uop=uop, val=val):
