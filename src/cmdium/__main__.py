@@ -75,13 +75,19 @@ def build_parser() -> argparse.ArgumentParser:
     help="name of entry function (default: '.main')",
   )
   pack.add_argument(
+    "--setup", default=".setup", metavar="NAME",
+    help="name of the setup function generated for you and registered in "
+         "the load tag (default: '.setup')",
+  )
+  pack.add_argument(
     "--legacy-names", action=argparse.BooleanOptionalAction, default=None,
     help="use 'functions/' instead of 'function/' directories "
          f"(default: on when pack-format < {FIRST_SINGULAR_PACK_FORMAT})",
   )
   pack.add_argument(
     "--autorun", action="store_true",
-    help="also run the program's entry function on world load, after .setup",
+    help="also run the program's entry function on world load, after the "
+         "setup function",
   )
 
   diag = p.add_argument_group("diagnostics")
@@ -152,7 +158,9 @@ def main(argv: list[str] | None = None) -> int:
 
   # codegen
   namespace = args.namespace or default_namespace(file)
-  mc_funcs = codegen.DatapackGen(ir_funcs, namespace).gen()
+  mc_funcs = codegen.DatapackGen(
+    ir_funcs, namespace, setup=args.setup
+  ).gen()
 
   if args.emit == "mcfunction":
     for name, fn in mc_funcs.items():
@@ -167,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
   legacy = args.legacy_names
   if legacy is None:
     legacy = args.pack_format < FIRST_SINGULAR_PACK_FORMAT
-  load = (".setup",)
+  load = (args.setup,)
 
   if args.autorun:
     load += (args.entry,)

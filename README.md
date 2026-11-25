@@ -18,7 +18,7 @@ Target: **Minecraft JE 1.21+** (`pack_format` 48 by default).
 - Variable declarations, assignment and compound assignment (`+=`, `-=`, …)
 - Struct and tuple literals + field access
 - `@export` attribute (exposes a variable to the scoreboard with a custom name)
-- Full pipeline: parse → type-check → lower to IR → optimize → codegen → data pack
+- Full pipeline: parse → type-check → lower to IR → codegen → data pack
 - Can emit intermediate representations (`ast`, `ir`, `mcfunction`) for debugging
 - Outputs either a directory or a `.zip` data pack
 
@@ -50,7 +50,8 @@ cmdium hello.cmdium
 Place the generated data pack into your world's `datapacks/` folder and `/reload`.
 
 By default the entry point is the top-level code (compiled into `.main`).  
-A `.setup` function is always generated and registered in `#minecraft:load`.
+A setup function named `.setup` is always generated and registered in
+`#minecraft:load`; pick another name with `--setup`.
 
 ---
 
@@ -119,6 +120,7 @@ cmdium [options] <input.cmdium>
 | `--pack-format N`       | `pack_format` in `pack.mcmeta`                   | `48` (1.21)          |
 | `-d`, `--description`   | Description written into `pack.mcmeta`           | empty                |
 | `--entry NAME`          | Name of the entry function                       | `.main`              |
+| `--setup NAME`          | Name of the generated setup function             | `.setup`             |
 | `--autorun`             | Also run the entry function on world load        | off                  |
 | `--emit {ast,ir,mcfunction,pack}`| Stop after a stage and print to stdout  | `pack`               |
 | `--check`               | Only parse + type-check, write nothing           |                      |
@@ -149,18 +151,20 @@ cmdium --emit mcfunction test.cmdium  # generated commands
     V  lowering.py        lower to SSA-like IR (basic blocks)
    IR functions
     │
-    V  optimize.py        constant folding, dead-code, block merging…
-   optimized IR
+    V  codegen.py         map IR values to global slots
+   slot assignments
     │
-    V  codegen.py         map IR → scoreboard / data / execute / function
+    V  abi.py             slots → scoreboard / data / execute / function
    mcfunction commands
     │
     V  datapack.py        write pack.mcmeta + function/ + load tag
    data pack (.zip or dir)
 ```
 
-Integers live in a scoreboard objective (named after the namespace).  
-Strings and more complex values live in a storage.
+Every scalar value of the program lives in one global **slot** (`slots.py`):
+a numeric id plus a storage kind, either a scoreboard score or an NBT tag.
+`abi.py` is the only module that knows Java Edition syntax; it names the
+slots and renders the commands. There is no optimiser stage yet.
 
 ---
 
@@ -172,8 +176,9 @@ cmdium/
 ├── syntax.py        # lexer + parser + AST
 ├── semantic.py      # type checker & symbol table
 ├── lowering.py      # AST → IR
-├── optimize.py      # IR optimisations
-├── codegen.py       # IR → Minecraft commands
+├── slots.py         # global slots: scoreboard or NBT
+├── codegen.py       # IR → slot-level commands
+├── abi.py           # slots & commands → mcfunction syntax
 ├── datapack.py      # pack writer
 ├── error.py         # diagnostics
 └── utils.py         # small helpers
